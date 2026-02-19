@@ -130,3 +130,9 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# C build artifacts
+csrc/*.o
+csrc/*.a
+csrc/ha_test
+csrc/ha_test.dSYM/
