@@ -64,7 +64,15 @@ Typical dimensions: n_samples ~ 200-500 timepoints, n_voxels ~ 10,000-40,000 cor
 
 ## C Library
 
-A complete C implementation lives in `csrc/`. It targets Apple Accelerate on macOS and LAPACK/BLAS on Linux, with planned GPU backends (CUDA, Metal).
+A complete C implementation lives in `csrc/` with three compute backends:
+
+| Backend | Precision | Platform | Description |
+|---------|-----------|----------|-------------|
+| **CPU FP64** | double | All | Default. Uses LAPACK/BLAS (Accelerate on macOS, OpenBLAS on Linux) |
+| **CPU FP32** | float | All | Single-precision variant for comparison |
+| **Metal GPU** | float | macOS | Apple Metal Performance Shaders via polar decomposition |
+
+Backend selection is at runtime via the `THaBackend` enum — no recompilation needed.
 
 ### Building
 
@@ -72,17 +80,18 @@ Requires a C11 compiler and a LAPACK/BLAS provider. On macOS the Apple Accelerat
 
 ```bash
 cd csrc
-make            # optimized build (-O2)
-make DEBUG=1    # debug build with AddressSanitizer
-make OPENMP=1   # enable OpenMP for searchlight parallelism
-make clean      # remove build artifacts
+make                # builds libhyperalignment.a (static) and .dylib/.so (shared)
+make DEBUG=1        # debug build with AddressSanitizer
+make OPENMP=1       # enable OpenMP for searchlight parallelism
+make test           # build and run all tests
+make clean          # remove build artifacts
 ```
 
-This produces a static library `libhyperalignment.a` and all object files.
+On macOS, the Metal frameworks are linked automatically. On Linux, only the CPU backends are available; the Metal header provides inline stubs that return error codes.
 
 ### Running Tests
 
-The test suite (`ha_test.c`) contains 1811 deterministic tests covering SVD, PCA, Procrustes, ridge regression, sparse matrices, searchlight weights, z-score, template construction, and ensemble cross-validation.
+The test suite (`ha_test.c`) contains 2621 deterministic tests covering all modules and all three backends.
 
 ```bash
 cd csrc
@@ -109,39 +118,156 @@ test_searchlight_weights_uniform
 test_zscore
 test_template_identical_subjects
 test_ensemble_indices
+test_svd_f32_reconstruction
+test_procrustes_f32_identity
+test_procrustes_f32_known_rotation
+test_procrustes_metal_identity
+test_procrustes_metal_known_rotation
+test_metal_cleanup
 
-1811 tests: 1811 passed, 0 failed
+2621 tests: 2621 passed, 0 failed
 ```
 
 ### C Source Layout
 
 ```
 csrc/
-    Makefile              Platform-detecting build system
-    ha_common.h           Types (TMat, TSparseCSC, TSearchlights), alloc helpers
-    ha_linalg.h/.c        SVD (dgesdd + dgesvd fallback), PCA, z-score
-    ha_procrustes.h/.c    Orthogonal Procrustes
+    Makefile              Platform-detecting build system (static + shared library)
+    ha_common.h           Types (TMat, TMatF, TSparseCSC, TSearchlights, THaBackend), alloc helpers
+    ha_linalg.h/.c        SVD FP64 (dgesdd/dgesvd), SVD FP32 (sgesdd/sgesvd), PCA, z-score
+    ha_procrustes.h/.c    Procrustes FP64 + FP32
     ha_ridge.h/.c         Ridge regression, grid search, ensemble ridge
     ha_sparse.h/.c        CSC sparse matrix init, scatter-add
-    ha_searchlight.h/.c   Searchlight weights and alignment loops
+    ha_searchlight.h/.c   Searchlight weights, alignment loops with backend dispatch
     ha_template.h/.c      Template construction (Procrustes, GPA, PCA)
     ha_ensemble.h/.c      Cross-validation index generation
+    ha_metal.h            Metal API header (stubs on non-Apple)
+    ha_metal.m            Metal/MPS implementation (macOS only, Objective-C)
     hyperalignment.h      Umbrella header
-    ha_test.c             Test harness
+    ha_test.c             Test harness (2621 tests)
 ```
 
-### Future GPU Backends
+### Metal GPU Backend
 
-**Phase 2 - CUDA**
-- cuSOLVER for batched SVD (all searchlights in one launch)
-- cuBLAS for batched GEMM
-- Custom kernels for sparse accumulation and normalization
+The Metal backend computes Procrustes alignment without SVD by using **polar decomposition via Newton iteration**:
 
-**Phase 3 - Metal**
-- Metal Performance Shaders for GEMM
-- Custom compute shaders for SVD
-- Apple Silicon unified memory
+```
+X_0 = X^T @ Y                          (GPU GEMM via MPSMatrixMultiplication)
+X_{k+1} = (X_k + X_k^{-T}) / 2        (CPU LAPACK inverse + transpose, ~6-10 iterations)
+T = X_converged                          (orthogonal polar factor)
+```
+
+This avoids the SVD entirely — Metal Performance Shaders provides GEMM, LU decomposition, and triangular solve, but not SVD. The Newton iteration converges cubically and typically needs 6-10 iterations for FP32 precision. Falls back to CPU FP32 SVD if the matrix is singular.
+
+### Python ctypes Wrapper
+
+`hyperalignment_c.py` provides a Python interface to the C library via ctypes. It loads the shared library (`libhyperalignment.dylib` or `.so`) and exposes a `searchlight_procrustes()` function compatible with the benchmark script.
+
+```python
+import hyperalignment_c as hac
+
+W = hac.searchlight_procrustes(
+    X, Y, sls, dists, radius,
+    backend='cpu64'  # or 'cpu32', 'metal'
+)
+# W is a scipy.sparse.csc_matrix
+```
+
+The wrapper handles all memory management: numpy arrays are passed to C by pointer (zero-copy for the input matrices), and the sparse result is copied into a scipy CSC matrix before freeing the C allocations.
+
+## Benchmarks
+
+### Setup
+
+Benchmarked on the StudyForrest dataset (Hanke et al., 2014) via `neuroboros`: 2 subjects, 4 training runs, 4 test runs, radius-20mm searchlights (~9,670 searchlights per hemisphere, ~19,341 cortical vertices per hemisphere). The benchmark runs searchlight Procrustes alignment on both hemispheres and evaluates vertex-wise correlation between aligned and target timeseries.
+
+Hardware: Apple M3 Max, 36 GB unified memory, macOS.
+
+### How to Run
+
+```bash
+# 1. Build the C library (from project root)
+cd csrc && make && cd ..
+
+# 2. Install Python dependencies
+pip install neuroboros hyperalignment scipy numpy
+
+# 3. Download the Forrest dataset (first run only, ~2 GB)
+python -c "import neuroboros; neuroboros.Forrest()"
+
+# 4. Run the benchmark
+python benchmark_neuroboros.py /path/to/neuroboros_data --backend python   # Python baseline
+python benchmark_neuroboros.py /path/to/neuroboros_data --backend c64      # C CPU FP64
+python benchmark_neuroboros.py /path/to/neuroboros_data --backend c32      # C CPU FP32
+python benchmark_neuroboros.py /path/to/neuroboros_data --backend metal    # Metal GPU FP32
+```
+
+On Linux, omit the `metal` backend (it will fall back to `c32` automatically).
+
+### Results
+
+Here are results for a [Apple M4 Pro](https://en.wikipedia.org/wiki/Apple_M4):
+
+| Backend | L hemi (s) | R hemi (s) | Total (s) | vs Python |
+|---------|-----------|-----------|-----------|-----------|
+| Python (numpy/BLAS) | ~35 | ~35 | 73 | 1.0x |
+| C CPU FP64 | 38.5 | 38.5 | 89 | 0.8x |
+| C CPU FP32 | 35.1 | 34.9 | 82 | 0.9x |
+| C Metal GPU FP32 | 53.9 | 54.8 | 121 | 0.6x |
+
+All backends produce identical output (test-set vertex-wise correlation percentiles):
+
+```
+[-0.2561 -0.0149  0.0030  0.0160  0.0282  0.0424  0.0594  0.0840  0.1252  0.2105  0.6171]
+```
+
+### Analysis
+
+**Correctness**: All four backends produce numerically identical percentile distributions at 4 decimal places. The FP32 backends (CPU and Metal) match FP64 to this precision because the searchlight weight normalization and sparse accumulation are done in FP64 regardless of the local Procrustes precision.
+
+**Performance**: The Python baseline is competitive because it uses the same underlying BLAS (Apple Accelerate) and numpy's vectorized operations minimize Python overhead in the inner loop. The C implementation currently runs each searchlight serially. Key optimization opportunities:
+
+- **OpenMP parallelism**: The searchlight loop is embarrassingly parallel. Building with `make OPENMP=1` would parallelize across CPU cores (expected 4-8x speedup on multi-core).
+- **Metal batching**: The current Metal implementation submits one GPU command buffer per searchlight (~19K serial round-trips). Batching multiple searchlights per command buffer or pipelining submissions would amortize GPU dispatch overhead.
+- **Sparse matrix init**: The `ha_sparse_init` function allocates and sorts all (row, col) pairs, which takes a few seconds for ~19K searchlights. This could be cached or pre-computed.
+
+The Metal backend is slower than CPU because the ~200x200 local matrices are too small for GPU dispatch overhead (~10μs per command buffer) to be amortized. GPU acceleration would become beneficial with either batched submissions or larger matrix sizes.
+
+### Replicating on Other Machines
+
+**macOS (Apple Silicon)**:
+```bash
+# All four backends available
+cd csrc && make && make test
+cd .. && python benchmark_neuroboros.py /path/to/data --backend metal
+```
+
+**macOS (Intel)**:
+```bash
+# Metal available but may not have MPS support for all operations
+# CPU backends recommended
+cd csrc && make && make test
+cd .. && python benchmark_neuroboros.py /path/to/data --backend c64
+```
+
+**Linux (Ubuntu/Debian)**:
+```bash
+# Install LAPACK/BLAS
+sudo apt install liblapack-dev libopenblas-dev
+
+# Build (Metal stubs are automatically provided; only CPU backends work)
+cd csrc && make && make test
+
+# Run benchmark (metal backend will fall back to c32 automatically)
+cd .. && python benchmark_neuroboros.py /path/to/data --backend c64
+```
+
+**Linux with OpenMP**:
+```bash
+cd csrc && make OPENMP=1 && make test
+```
 
 ## References
 
 - Haxby, J.V., Guntupalli, J.S., Connolly, A.C., et al. (2011). A common, high-dimensional model of the representational space in human ventral temporal cortex. *Neuron*, 72(2), 404-416.
+- Hanke, M., Baumgartner, F.J., Ibe, P., et al. (2014). A high-resolution 7-Tesla fMRI dataset from complex natural stimulation with an audio movie. *Scientific Data*, 1, 140003.

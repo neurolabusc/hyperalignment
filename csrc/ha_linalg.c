@@ -152,6 +152,114 @@ void ha_remove_col_mean(TMat *X) {
 	free(means);
 }
 
+// ---- Single-precision (FP32) variants ----
+
+static void ha_remove_col_mean_f32(TMatF *X) {
+	int32_t M = X->rows;
+	int32_t N = X->cols;
+	float *means = (float *)calloc((size_t)N, sizeof(float));
+	if (!means) return;
+	float inv_M = 1.0f / M;
+	for (int32_t i = 0; i < M; i++)
+		for (int32_t j = 0; j < N; j++)
+			means[j] += X->data[i * N + j];
+	for (int32_t j = 0; j < N; j++)
+		means[j] *= inv_M;
+	for (int32_t i = 0; i < M; i++)
+		for (int32_t j = 0; j < N; j++)
+			X->data[i * N + j] -= means[j];
+	free(means);
+}
+
+int ha_svd_f32(TMatF *X, TMatF *U, float *s, TMatF *Vt, bool isRemoveMean) {
+	if (isRemoveMean)
+		ha_remove_col_mean_f32(X);
+
+	int32_t M = X->rows;
+	int32_t N = X->cols;
+	int32_t K = (M < N) ? M : N;
+
+	size_t data_sz = (size_t)M * N * sizeof(float);
+	float *X_backup = (float *)malloc(data_sz);
+	if (!X_backup) return kHaErrorAlloc;
+	memcpy(X_backup, X->data, data_sz);
+
+	ha_lapack_int lM = M, lN = N;
+	ha_lapack_int lwork = -1;
+	ha_lapack_int info = 0;
+	float work_query;
+	ha_lapack_int *iwork = (ha_lapack_int *)malloc(8 * K * sizeof(ha_lapack_int));
+	if (!iwork) { free(X_backup); return kHaErrorAlloc; }
+
+	ha_lapack_int ldA = lN;
+	ha_lapack_int ldU_lap = lN;
+	ha_lapack_int ldVt_lap = K;
+
+	char jobz = 'S';
+	sgesdd_(&jobz, &lN, &lM, X->data, &ldA, s,
+	        Vt->data, &ldU_lap,
+	        U->data, &ldVt_lap,
+	        &work_query, &lwork, iwork, &info);
+
+	lwork = (ha_lapack_int)work_query;
+	float *work = (float *)malloc((size_t)lwork * sizeof(float));
+	if (!work) { free(iwork); free(X_backup); return kHaErrorAlloc; }
+
+	sgesdd_(&jobz, &lN, &lM, X->data, &ldA, s,
+	        Vt->data, &ldU_lap,
+	        U->data, &ldVt_lap,
+	        work, &lwork, iwork, &info);
+
+	if (info != 0) {
+		memcpy(X->data, X_backup, data_sz);
+
+		lwork = -1;
+		char jobu = 'S', jobvt = 'S';
+		sgesvd_(&jobu, &jobvt, &lN, &lM, X->data, &ldA, s,
+		        Vt->data, &ldU_lap,
+		        U->data, &ldVt_lap,
+		        &work_query, &lwork, &info);
+
+		lwork = (ha_lapack_int)work_query;
+		float *work2 = (float *)realloc(work, (size_t)lwork * sizeof(float));
+		if (!work2) { free(work); free(iwork); free(X_backup); return kHaErrorAlloc; }
+		work = work2;
+
+		info = 0;
+		sgesvd_(&jobu, &jobvt, &lN, &lM, X->data, &ldA, s,
+		        Vt->data, &ldU_lap,
+		        U->data, &ldVt_lap,
+		        work, &lwork, &info);
+	}
+
+	free(work);
+	free(iwork);
+	free(X_backup);
+	return (info == 0) ? kHaSuccess : kHaErrorSvd;
+}
+
+int ha_svd_alloc_f32(const TMatF *X, TMatF **U_out, float **s_out, TMatF **Vt_out,
+                     bool isRemoveMean) {
+	int32_t M = X->rows, N = X->cols, K = (M < N) ? M : N;
+	TMatF *Xc = ha_matf_copy(X);
+	if (!Xc) return kHaErrorAlloc;
+	TMatF *U = ha_matf_alloc(M, K);
+	float *s = (float *)malloc((size_t)K * sizeof(float));
+	TMatF *Vt = ha_matf_alloc(K, N);
+	if (!U || !s || !Vt) {
+		ha_matf_free(Xc); ha_matf_free(U); free(s); ha_matf_free(Vt);
+		return kHaErrorAlloc;
+	}
+	int rc = ha_svd_f32(Xc, U, s, Vt, isRemoveMean);
+	ha_matf_free(Xc);
+	if (rc != kHaSuccess) {
+		ha_matf_free(U); free(s); ha_matf_free(Vt);
+		return rc;
+	}
+	*U_out = U; *s_out = s; *Vt_out = Vt;
+	return kHaSuccess;
+}
+
 void ha_zscore_columns(TMat *X) {
 	int32_t M = X->rows;
 	int32_t N = X->cols;

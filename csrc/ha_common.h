@@ -64,8 +64,59 @@ typedef struct {
 	double radius;      // searchlight radius (0 if uniform)
 } TSearchlights;
 
-// Element access macro
+// Backend selection for searchlight functions
+typedef enum {
+	kHaBackendCPU64 = 0,   // CPU double precision (default)
+	kHaBackendCPU32 = 1,   // CPU single precision
+	kHaBackendMetal = 2,   // Metal GPU (FP32)
+} THaBackend;
+
+// Element access macros
 #define MAT_AT(m, i, j) ((m)->data[(i) * (m)->cols + (j)])
+#define MATF_AT(m, i, j) ((m)->data[(i) * (m)->cols + (j)])
+
+// Dense matrix: row-major, single precision
+typedef struct {
+	float *data;
+	int32_t rows;
+	int32_t cols;
+} TMatF;
+
+// ---- TMatF allocation helpers ----
+
+static inline TMatF *ha_matf_alloc(int32_t rows, int32_t cols) {
+	TMatF *m = (TMatF *)malloc(sizeof(TMatF));
+	if (!m) return NULL;
+	m->rows = rows;
+	m->cols = cols;
+	m->data = (float *)malloc((size_t)rows * cols * sizeof(float));
+	if (!m->data) { free(m); return NULL; }
+	return m;
+}
+
+static inline TMatF *ha_matf_calloc(int32_t rows, int32_t cols) {
+	TMatF *m = (TMatF *)malloc(sizeof(TMatF));
+	if (!m) return NULL;
+	m->rows = rows;
+	m->cols = cols;
+	m->data = (float *)calloc((size_t)rows * cols, sizeof(float));
+	if (!m->data) { free(m); return NULL; }
+	return m;
+}
+
+static inline TMatF *ha_matf_copy(const TMatF *src) {
+	TMatF *m = ha_matf_alloc(src->rows, src->cols);
+	if (!m) return NULL;
+	memcpy(m->data, src->data, (size_t)src->rows * src->cols * sizeof(float));
+	return m;
+}
+
+static inline void ha_matf_free(TMatF *m) {
+	if (m) {
+		free(m->data);
+		free(m);
+	}
+}
 
 // ---- TMat allocation helpers ----
 
@@ -105,6 +156,26 @@ static inline void ha_mat_free(TMat *m) {
 		free(m->data);
 		free(m);
 	}
+}
+
+// ---- Precision conversion ----
+
+static inline TMatF *ha_mat_to_float(const TMat *src) {
+	TMatF *m = ha_matf_alloc(src->rows, src->cols);
+	if (!m) return NULL;
+	size_t n = (size_t)src->rows * src->cols;
+	for (size_t i = 0; i < n; i++)
+		m->data[i] = (float)src->data[i];
+	return m;
+}
+
+static inline TMat *ha_matf_to_double(const TMatF *src) {
+	TMat *m = ha_mat_alloc(src->rows, src->cols);
+	if (!m) return NULL;
+	size_t n = (size_t)src->rows * src->cols;
+	for (size_t i = 0; i < n; i++)
+		m->data[i] = (double)src->data[i];
+	return m;
 }
 
 // ---- TSparseCSC helpers ----

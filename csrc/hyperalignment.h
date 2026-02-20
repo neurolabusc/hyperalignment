@@ -13,5 +13,6 @@
 #include "ha_searchlight.h"
 #include "ha_template.h"
 #include "ha_ensemble.h"
+#include "ha_metal.h"
 
 #endif // HYPERALIGNMENT_H

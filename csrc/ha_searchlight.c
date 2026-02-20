@@ -11,6 +11,7 @@
 #include "ha_procrustes.h"
 #include "ha_ridge.h"
 #include "ha_sparse.h"
+#include "ha_metal.h"
 
 int ha_searchlight_weights(const TSearchlights *sls, double **weights_out) {
 	// Find max vertex index
@@ -146,11 +147,76 @@ int ha_searchlight_procrustes(const TMat *X, const TMat *Y,
                               const TSearchlights *sls_Y,
                               TSparseCSC *mat,
                               double **weights,
-                              bool isReflection, bool isScaling) {
+                              bool isReflection, bool isScaling,
+                              THaBackend backend) {
 	const TSearchlights *sls_Y_actual = sls_Y ? sls_Y : sls_X;
-	tl_proc_opts.isReflection = isReflection;
-	tl_proc_opts.isScaling = isScaling;
-	return searchlight_loop(X, Y, sls_X, sls_Y_actual, mat, weights, sl_procrustes_func);
+
+	// CPU FP64 path (default)
+	if (backend == kHaBackendCPU64) {
+		tl_proc_opts.isReflection = isReflection;
+		tl_proc_opts.isScaling = isScaling;
+		return searchlight_loop(X, Y, sls_X, sls_Y_actual, mat, weights, sl_procrustes_func);
+	}
+
+	// Metal path: fall back to CPU32 if Metal not available
+	THaBackend actual = backend;
+	if (actual == kHaBackendMetal && !ha_metal_available())
+		actual = kHaBackendCPU32;
+
+	// CPU FP32 or Metal FP32 path
+	int32_t nt = X->rows;
+	for (int32_t s = 0; s < sls_X->count; s++) {
+		int32_t *sl_x = sls_X->indices[s];
+		int32_t *sl_y = sls_Y_actual->indices[s];
+		int32_t sz_x = sls_X->sizes[s];
+		int32_t sz_y = sls_Y_actual->sizes[s];
+
+		// Extract local submatrices (double)
+		TMat *local_X = ha_mat_alloc(nt, sz_x);
+		TMat *local_Y = ha_mat_alloc(nt, sz_y);
+		if (!local_X || !local_Y) {
+			ha_mat_free(local_X); ha_mat_free(local_Y);
+			return kHaErrorAlloc;
+		}
+		ha_mat_extract_cols(X, sl_x, sz_x, local_X);
+		ha_mat_extract_cols(Y, sl_y, sz_y, local_Y);
+
+		// Convert to float
+		TMatF *fX = ha_mat_to_float(local_X);
+		TMatF *fY = ha_mat_to_float(local_Y);
+		TMatF *fT = ha_matf_alloc(sz_x, sz_y);
+		ha_mat_free(local_X);
+		ha_mat_free(local_Y);
+		if (!fX || !fY || !fT) {
+			ha_matf_free(fX); ha_matf_free(fY); ha_matf_free(fT);
+			return kHaErrorAlloc;
+		}
+
+		// Compute Procrustes (FP32)
+		int rc;
+		if (actual == kHaBackendMetal)
+			rc = ha_procrustes_metal(fX, fY, fT, isReflection, isScaling);
+		else
+			rc = ha_procrustes_f32(fX, fY, fT, isReflection, isScaling);
+
+		if (rc != kHaSuccess) {
+			ha_matf_free(fX); ha_matf_free(fY); ha_matf_free(fT);
+			return rc;
+		}
+
+		// Convert result back to double for scatter-add
+		TMat *local_T = ha_matf_to_double(fT);
+		ha_matf_free(fX);
+		ha_matf_free(fY);
+		ha_matf_free(fT);
+		if (!local_T) return kHaErrorAlloc;
+
+		double *w = weights ? weights[s] : NULL;
+		ha_sparse_scatter_add(mat, sl_x, sl_y, sz_x, sz_y, local_T->data, w);
+		ha_mat_free(local_T);
+	}
+
+	return kHaSuccess;
 }
 
 int ha_searchlight_ridge(const TMat *X, const TMat *Y,

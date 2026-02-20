@@ -36,7 +36,8 @@ int ha_searchlight_procrustes(const TMat *X, const TMat *Y,
                               const TSearchlights *sls_Y,
                               TSparseCSC *mat,
                               double **weights,
-                              bool isReflection, bool isScaling);
+                              bool isReflection, bool isScaling,
+                              THaBackend backend);
 
 /*
  * Searchlight ridge alignment.

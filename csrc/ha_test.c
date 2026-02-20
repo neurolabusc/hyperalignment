@@ -561,6 +561,219 @@ static void test_ensemble_indices(void) {
 	ha_ensemble_indices_free(train_li, test_li, train_sz, test_sz, n_splits);
 }
 
+// ---- FP32 SVD Test ----
+
+static void test_svd_f32_reconstruction(void) {
+	printf("test_svd_f32_reconstruction\n");
+	test_rng_seed(42);
+
+	int32_t M = 50, N = 30;
+	int32_t K = N;
+
+	TMat *Xd = ha_mat_alloc(M, N);
+	fill_randn(Xd);
+	TMatF *X = ha_mat_to_float(Xd);
+	TMatF *X_orig = ha_matf_copy(X);
+
+	TMatF *U = ha_matf_alloc(M, K);
+	float *s = (float *)malloc((size_t)K * sizeof(float));
+	TMatF *Vt = ha_matf_alloc(K, N);
+
+	int rc = ha_svd_f32(X, U, s, Vt, false);
+	ASSERT_TRUE(rc == kHaSuccess, "ha_svd_f32 returns success");
+
+	// Reconstruct: X_rec = U * diag(s) * Vt
+	TMatF *Us = ha_matf_alloc(M, K);
+	for (int32_t i = 0; i < M; i++)
+		for (int32_t j = 0; j < K; j++)
+			Us->data[i * K + j] = U->data[i * K + j] * s[j];
+
+	TMatF *X_rec = ha_matf_alloc(M, N);
+	cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+	            M, N, K, 1.0f, Us->data, K, Vt->data, N, 0.0f, X_rec->data, N);
+
+	float max_err = 0.0f;
+	for (int32_t i = 0; i < M * N; i++) {
+		float err = fabsf(X_rec->data[i] - X_orig->data[i]);
+		if (err > max_err) max_err = err;
+	}
+	ASSERT_TRUE(max_err < 1e-4, "SVD f32 reconstruction error < 1e-4");
+
+	ha_mat_free(Xd);
+	ha_matf_free(X); ha_matf_free(X_orig); ha_matf_free(U);
+	free(s); ha_matf_free(Vt); ha_matf_free(Us); ha_matf_free(X_rec);
+}
+
+// ---- FP32 Procrustes Tests ----
+
+static void test_procrustes_f32_identity(void) {
+	printf("test_procrustes_f32_identity\n");
+	test_rng_seed(77);
+
+	int32_t M = 50, N = 20;
+	TMat *Xd = ha_mat_alloc(M, N);
+	fill_randn(Xd);
+	TMatF *X = ha_mat_to_float(Xd);
+
+	TMatF *T = ha_matf_alloc(N, N);
+	int rc = ha_procrustes_f32(X, X, T, true, false);
+	ASSERT_TRUE(rc == kHaSuccess, "procrustes_f32 identity returns success");
+
+	for (int32_t i = 0; i < N; i++)
+		for (int32_t j = 0; j < N; j++) {
+			float expected = (i == j) ? 1.0f : 0.0f;
+			ASSERT_CLOSE(fabsf(T->data[i * N + j]), fabsf(expected), 1e-4,
+			             "procrustes_f32 identity element");
+		}
+
+	ha_mat_free(Xd);
+	ha_matf_free(X); ha_matf_free(T);
+}
+
+static void test_procrustes_f32_known_rotation(void) {
+	printf("test_procrustes_f32_known_rotation\n");
+	test_rng_seed(55);
+
+	int32_t M = 50, N = 10;
+	TMat *Xd = ha_mat_alloc(M, N);
+	fill_randn(Xd);
+	TMatF *X = ha_mat_to_float(Xd);
+
+	// Create a known rotation
+	TMatF *R = ha_matf_calloc(N, N);
+	for (int32_t i = 0; i < N; i++)
+		R->data[i * N + i] = 1.0f;
+	float angle = 0.7f;
+	R->data[0 * N + 0] = cosf(angle);
+	R->data[0 * N + 1] = -sinf(angle);
+	R->data[1 * N + 0] = sinf(angle);
+	R->data[1 * N + 1] = cosf(angle);
+
+	// Y = X @ R
+	TMatF *Y = ha_matf_alloc(M, N);
+	cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+	            M, N, N, 1.0f, X->data, N, R->data, N, 0.0f, Y->data, N);
+
+	TMatF *T = ha_matf_alloc(N, N);
+	int rc = ha_procrustes_f32(X, Y, T, true, false);
+	ASSERT_TRUE(rc == kHaSuccess, "procrustes_f32 known rotation returns success");
+
+	// X @ T should be close to Y
+	TMatF *XT = ha_matf_alloc(M, N);
+	cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+	            M, N, N, 1.0f, X->data, N, T->data, N, 0.0f, XT->data, N);
+
+	float max_err = 0.0f;
+	for (int32_t i = 0; i < M * N; i++) {
+		float err = fabsf(XT->data[i] - Y->data[i]);
+		if (err > max_err) max_err = err;
+	}
+	ASSERT_TRUE(max_err < 1e-4, "procrustes_f32 known rotation alignment error < 1e-4");
+
+	ha_mat_free(Xd);
+	ha_matf_free(X); ha_matf_free(R); ha_matf_free(Y);
+	ha_matf_free(T); ha_matf_free(XT);
+}
+
+// ---- Metal Procrustes Tests (macOS only) ----
+
+#ifdef __APPLE__
+static void test_procrustes_metal_identity(void) {
+	printf("test_procrustes_metal_identity\n");
+
+	if (ha_metal_init() != kHaSuccess) {
+		printf("  (skipped: Metal not available)\n");
+		return;
+	}
+
+	test_rng_seed(77);
+	int32_t M = 50, N = 20;
+	TMat *Xd = ha_mat_alloc(M, N);
+	fill_randn(Xd);
+	TMatF *X = ha_mat_to_float(Xd);
+
+	TMatF *T = ha_matf_alloc(N, N);
+	int rc = ha_procrustes_metal(X, X, T, true, false);
+	ASSERT_TRUE(rc == kHaSuccess, "procrustes_metal identity returns success");
+
+	for (int32_t i = 0; i < N; i++)
+		for (int32_t j = 0; j < N; j++) {
+			float expected = (i == j) ? 1.0f : 0.0f;
+			ASSERT_CLOSE(fabsf(T->data[i * N + j]), fabsf(expected), 1e-3,
+			             "procrustes_metal identity element");
+		}
+
+	ha_mat_free(Xd);
+	ha_matf_free(X); ha_matf_free(T);
+}
+
+static void test_procrustes_metal_known_rotation(void) {
+	printf("test_procrustes_metal_known_rotation\n");
+
+	if (!ha_metal_available()) {
+		printf("  (skipped: Metal not available)\n");
+		return;
+	}
+
+	test_rng_seed(55);
+	int32_t M = 50, N = 10;
+	TMat *Xd = ha_mat_alloc(M, N);
+	fill_randn(Xd);
+	TMatF *X = ha_mat_to_float(Xd);
+
+	// Same rotation as CPU test
+	TMatF *R = ha_matf_calloc(N, N);
+	for (int32_t i = 0; i < N; i++)
+		R->data[i * N + i] = 1.0f;
+	float angle = 0.7f;
+	R->data[0 * N + 0] = cosf(angle);
+	R->data[0 * N + 1] = -sinf(angle);
+	R->data[1 * N + 0] = sinf(angle);
+	R->data[1 * N + 1] = cosf(angle);
+
+	TMatF *Y = ha_matf_alloc(M, N);
+	cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+	            M, N, N, 1.0f, X->data, N, R->data, N, 0.0f, Y->data, N);
+
+	TMatF *T = ha_matf_alloc(N, N);
+	int rc = ha_procrustes_metal(X, Y, T, true, false);
+	ASSERT_TRUE(rc == kHaSuccess, "procrustes_metal known rotation returns success");
+
+	// Compare Metal result with CPU FP32 result
+	TMatF *T_cpu = ha_matf_alloc(N, N);
+	ha_procrustes_f32(X, Y, T_cpu, true, false);
+
+	float max_diff = 0.0f;
+	for (int32_t i = 0; i < N * N; i++) {
+		float diff = fabsf(T->data[i] - T_cpu->data[i]);
+		if (diff > max_diff) max_diff = diff;
+	}
+	ASSERT_TRUE(max_diff < 1e-3, "Metal vs CPU FP32 Procrustes match within 1e-3");
+
+	// Verify alignment quality
+	TMatF *XT = ha_matf_alloc(M, N);
+	cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+	            M, N, N, 1.0f, X->data, N, T->data, N, 0.0f, XT->data, N);
+
+	float max_err = 0.0f;
+	for (int32_t i = 0; i < M * N; i++) {
+		float err = fabsf(XT->data[i] - Y->data[i]);
+		if (err > max_err) max_err = err;
+	}
+	ASSERT_TRUE(max_err < 1e-3, "procrustes_metal known rotation alignment error < 1e-3");
+
+	ha_mat_free(Xd);
+	ha_matf_free(X); ha_matf_free(R); ha_matf_free(Y);
+	ha_matf_free(T); ha_matf_free(T_cpu); ha_matf_free(XT);
+}
+
+static void test_metal_cleanup(void) {
+	printf("test_metal_cleanup\n");
+	ha_metal_cleanup();
+	ASSERT_TRUE(!ha_metal_available(), "Metal not available after cleanup");
+}
+#endif // __APPLE__
+
 // ---- Main ----
 
 int main(void) {
@@ -580,6 +793,18 @@ int main(void) {
 	test_zscore();
 	test_template_identical_subjects();
 	test_ensemble_indices();
+
+	// FP32 tests
+	test_svd_f32_reconstruction();
+	test_procrustes_f32_identity();
+	test_procrustes_f32_known_rotation();
+
+#ifdef __APPLE__
+	// Metal GPU tests
+	test_procrustes_metal_identity();
+	test_procrustes_metal_known_rotation();
+	test_metal_cleanup();
+#endif
 
 	printf("\n%d tests: %d passed, %d failed\n", n_tests, n_passed, n_failed);
 	return n_failed > 0 ? 1 : 0;

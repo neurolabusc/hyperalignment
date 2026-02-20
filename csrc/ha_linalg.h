@@ -47,4 +47,18 @@ void ha_remove_col_mean(TMat *X);
  */
 void ha_zscore_columns(TMat *X);
 
+// ---- Single-precision (FP32) variants ----
+
+/*
+ * SVD of a float matrix. Same algorithm as ha_svd but uses sgesdd/sgesvd.
+ * X is destroyed. Caller must pre-allocate U, s, Vt.
+ */
+int ha_svd_f32(TMatF *X, TMatF *U, float *s, TMatF *Vt, bool isRemoveMean);
+
+/*
+ * Convenience wrapper: copies X, allocates U/s/Vt, performs SVD (FP32).
+ */
+int ha_svd_alloc_f32(const TMatF *X, TMatF **U_out, float **s_out, TMatF **Vt_out,
+                     bool isRemoveMean);
+
 #endif // HA_LINALG_H

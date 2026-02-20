@@ -20,4 +20,11 @@
 int ha_procrustes(const TMat *X, const TMat *Y, TMat *T,
                   bool isReflection, bool isScaling);
 
+/*
+ * Single-precision (FP32) Procrustes.
+ * Same algorithm as ha_procrustes but uses float matrices and sgemm/sgesdd.
+ */
+int ha_procrustes_f32(const TMatF *X, const TMatF *Y, TMatF *T,
+                      bool isReflection, bool isScaling);
+
 #endif // HA_PROCRUSTES_H
