@@ -4,6 +4,7 @@ benchmark_neuroboros.py
 
 Usage:
     python benchmark_neuroboros.py /path/to/neuroboros_backup
+    python benchmark_neuroboros.py /path/to/neuroboros_backup --backend c64 --n-jobs 10 --repeat 3
 
 This script forces neuroboros to use the local data directory you provide,
 runs the benchmark code, saves r_test0 to disk (NPZ + NPY), and prints elapsed time.
@@ -52,6 +53,10 @@ def main():
     p.add_argument("--outdir", default=None, help="Optional output directory (defaults to <data_dir>/results).")
     p.add_argument("--backend", choices=["python", "c64", "c32", "metal"], default="python",
                    help="Backend: python (default), c64 (C CPU FP64), c32 (C CPU FP32), metal (C Metal GPU FP32)")
+    p.add_argument("--n-jobs", type=int, default=1,
+                   help="Number of OpenMP threads for C backends (default: 1). Requires OPENMP=1 build.")
+    p.add_argument("--repeat", type=int, default=1,
+                   help="Number of times to repeat the alignment (default: 1). Reports median.")
     args = p.parse_args()
 
     base = os.path.abspath(os.path.expanduser(args.data_dir))
@@ -77,7 +82,7 @@ def main():
         traceback.print_exc()
         sys.exit(3)
 
-    print(f"Backend: {args.backend}")
+    print(f"Backend: {args.backend}, n_jobs: {args.n_jobs}, repeat: {args.repeat}")
 
     # Instantiate the dataset
     dset = nb.Forrest()
@@ -118,39 +123,71 @@ def main():
     os.makedirs(outdir, exist_ok=True)
     print("Results will be written to:", outdir)
 
-    # Start timer
-    t0 = time.perf_counter()
-
     # Run the benchmark code (mirrors the code you provided)
     try:
         sids = dset.subjects
         print("Subjects:", sids)
 
+        # ---- Load data once ----
+        t_load = time.perf_counter()
         X_train, X_test = {}, {}
         Y_train, Y_test = {}, {}
+        sls_data, dists_data = {}, {}
+        radius = 20
         for lr in "lr":
-            # dset.get_data signature in your environment worked with (sid, 'forrest', run, lr)
             X_train[lr] = np.concatenate([dset.get_data(sids[0], "forrest", run_, lr) for run_ in [1, 2, 3, 4]], axis=0)
             Y_train[lr] = np.concatenate([dset.get_data(sids[1], "forrest", run_, lr) for run_ in [1, 2, 3, 4]], axis=0)
             X_test[lr] = np.concatenate([dset.get_data(sids[0], "forrest", run_, lr) for run_ in [5, 6, 7, 8]], axis=0)
             Y_test[lr] = np.concatenate([dset.get_data(sids[1], "forrest", run_, lr) for run_ in [5, 6, 7, 8]], axis=0)
+            sls_data[lr], dists_data[lr] = nb.sls(lr, radius, return_dists=True)
+        print(f"Data loaded in {time.perf_counter() - t_load:.2f}s")
 
-        radius = 20
-        Ws = {}
-        for lr in "lr":
-            sls, dists = nb.sls(lr, radius, return_dists=True)
-            t_align = time.perf_counter()
-            if args.backend == "python":
-                W = ha.searchlight_procrustes(
-                    X_train[lr], Y_train[lr], sls, dists, radius
-                )
+        # ---- Alignment loop (repeated) ----
+        all_times_l = []
+        all_times_r = []
+        all_times_total = []
+
+        for rep in range(args.repeat):
+            Ws = {}
+            t_total = time.perf_counter()
+            for lr in "lr":
+                sls = sls_data[lr]
+                dists = dists_data[lr]
+                t_align = time.perf_counter()
+                if args.backend == "python":
+                    W = ha.searchlight_procrustes(
+                        X_train[lr], Y_train[lr], sls, dists, radius
+                    )
+                else:
+                    W = hac.searchlight_procrustes(
+                        X_train[lr], Y_train[lr], sls, dists, radius,
+                        backend=args.backend, n_jobs=args.n_jobs
+                    )
+                elapsed_lr = time.perf_counter() - t_align
+                if lr == "l":
+                    all_times_l.append(elapsed_lr)
+                else:
+                    all_times_r.append(elapsed_lr)
+                Ws[lr] = W
+            elapsed_total = time.perf_counter() - t_total
+            all_times_total.append(elapsed_total)
+
+            n_sls_l = len(sls_data["l"])
+            n_sls_r = len(sls_data["r"])
+            if args.repeat > 1:
+                print(f"  Run {rep+1}/{args.repeat}: "
+                      f"l={all_times_l[-1]:.2f}s ({n_sls_l} SLs), "
+                      f"r={all_times_r[-1]:.2f}s ({n_sls_r} SLs), "
+                      f"total={elapsed_total:.2f}s")
             else:
-                W = hac.searchlight_procrustes(
-                    X_train[lr], Y_train[lr], sls, dists, radius,
-                    backend=args.backend
-                )
-            print(f"  {lr} hemisphere: {time.perf_counter() - t_align:.2f}s ({len(sls)} searchlights)")
-            Ws[lr] = W
+                print(f"  l hemisphere: {all_times_l[-1]:.2f}s ({n_sls_l} searchlights)")
+                print(f"  r hemisphere: {all_times_r[-1]:.2f}s ({n_sls_r} searchlights)")
+
+        if args.repeat > 1:
+            med_l = np.median(all_times_l)
+            med_r = np.median(all_times_r)
+            med_total = np.median(all_times_total)
+            print(f"  Median: l={med_l:.2f}s, r={med_r:.2f}s, total={med_total:.2f}s")
 
         # compute r_train0 and r_test0
         r_train0 = np.concatenate([
@@ -197,14 +234,8 @@ def main():
     except Exception:
         print("Benchmark run failed. Traceback:")
         traceback.print_exc()
-        # still compute elapsed and exit with non-zero
-        elapsed = time.perf_counter() - t0
-        print(f"Elapsed time: {elapsed:.2f} seconds")
         sys.exit(4)
 
-    # Final elapsed time
-    elapsed = time.perf_counter() - t0
-    print(f"Total elapsed time: {elapsed:.2f} seconds")
     print("Done.")
 
 if __name__ == "__main__":

@@ -117,6 +117,13 @@ _lib.ha_metal_cleanup.argtypes = []
 _lib.ha_metal_available.restype = ctypes.c_bool
 _lib.ha_metal_available.argtypes = []
 
+# Thread control
+_lib.ha_set_num_threads.restype = None
+_lib.ha_set_num_threads.argtypes = [ctypes.c_int]
+
+_lib.ha_get_num_threads.restype = ctypes.c_int
+_lib.ha_get_num_threads.argtypes = []
+
 
 # ---------------------------------------------------------------------------
 # Backend enum values (matches THaBackend in ha_common.h)
@@ -225,7 +232,7 @@ def _free_sparse(mat_ptr):
 # ---------------------------------------------------------------------------
 
 def searchlight_procrustes(X, Y, sls, dists, radius, backend="cpu64",
-                           reflection=True, scaling=False):
+                           reflection=True, scaling=False, n_jobs=1):
     """
     Searchlight Procrustes alignment using the C hyperalignment library.
 
@@ -247,6 +254,9 @@ def searchlight_procrustes(X, Y, sls, dists, radius, backend="cpu64",
         Allow reflection in Procrustes (default True).
     scaling : bool
         Allow scaling in Procrustes (default False).
+    n_jobs : int
+        Number of OpenMP threads. Default 1 (single-threaded).
+        Requires the library to be compiled with OPENMP=1.
 
     Returns
     -------
@@ -257,6 +267,10 @@ def searchlight_procrustes(X, Y, sls, dists, radius, backend="cpu64",
         raise ValueError(f"Unknown backend '{backend}'. Choose from: {list(_BACKENDS.keys())}")
 
     backend_enum = _BACKENDS[backend]
+
+    # Set thread count
+    if n_jobs > 0:
+        _lib.ha_set_num_threads(n_jobs)
 
     # Build C structs
     X_c, X_keep = _make_mat(X)

@@ -8,6 +8,18 @@
 #include "ha_common.h"
 
 /*
+ * Set the number of OpenMP threads for searchlight loops.
+ * Has no effect if the library was compiled without OpenMP.
+ */
+void ha_set_num_threads(int n);
+
+/*
+ * Get the current maximum number of OpenMP threads.
+ * Returns 1 if compiled without OpenMP.
+ */
+int ha_get_num_threads(void);
+
+/*
  * Compute searchlight combination weights (uniform or distance-based).
  * Weights are normalized to sum to 1.0 at each vertex.
  *

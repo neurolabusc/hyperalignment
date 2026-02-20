@@ -181,13 +181,15 @@ The wrapper handles all memory management: numpy arrays are passed to C by point
 
 Benchmarked on the StudyForrest dataset (Hanke et al., 2014) via `neuroboros`: 2 subjects, 4 training runs, 4 test runs, radius-20mm searchlights (~9,670 searchlights per hemisphere, ~19,341 cortical vertices per hemisphere). The benchmark runs searchlight Procrustes alignment on both hemispheres and evaluates vertex-wise correlation between aligned and target timeseries.
 
-Hardware: Apple M3 Max, 36 GB unified memory, macOS.
+Hardware: Apple M4 Pro (10 performance + 4 efficiency cores), 48 GB unified memory, macOS.
+
+All times are median of 3 repeats. Data is loaded once before timing begins.
 
 ### How to Run
 
 ```bash
-# 1. Build the C library (from project root)
-cd csrc && make && cd ..
+# 1. Build the C library with OpenMP support
+cd csrc && make OPENMP=1 && cd ..
 
 # 2. Install Python dependencies
 pip install neuroboros hyperalignment scipy numpy
@@ -195,25 +197,34 @@ pip install neuroboros hyperalignment scipy numpy
 # 3. Download the Forrest dataset (first run only, ~2 GB)
 python -c "import neuroboros; neuroboros.Forrest()"
 
-# 4. Run the benchmark
-python benchmark_neuroboros.py /path/to/neuroboros_data --backend python   # Python baseline
-python benchmark_neuroboros.py /path/to/neuroboros_data --backend c64      # C CPU FP64
-python benchmark_neuroboros.py /path/to/neuroboros_data --backend c32      # C CPU FP32
-python benchmark_neuroboros.py /path/to/neuroboros_data --backend metal    # Metal GPU FP32
+# 4. Run benchmarks (3 repeats, report median)
+python benchmark_neuroboros.py /path/to/data --backend python --repeat 3
+python benchmark_neuroboros.py /path/to/data --backend c64  --n-jobs 1  --repeat 3
+python benchmark_neuroboros.py /path/to/data --backend c64  --n-jobs 10 --repeat 3
+python benchmark_neuroboros.py /path/to/data --backend c32  --n-jobs 1  --repeat 3
+python benchmark_neuroboros.py /path/to/data --backend c32  --n-jobs 10 --repeat 3
+python benchmark_neuroboros.py /path/to/data --backend metal --n-jobs 1  --repeat 3
+python benchmark_neuroboros.py /path/to/data --backend metal --n-jobs 10 --repeat 3
 ```
+
+Options:
+- `--backend`: `python`, `c64`, `c32`, `metal`
+- `--n-jobs N`: Number of OpenMP threads for C backends (default: 1). Requires `OPENMP=1` build.
+- `--repeat N`: Number of alignment repeats (default: 1). Reports median when N > 1.
 
 On Linux, omit the `metal` backend (it will fall back to `c32` automatically).
 
 ### Results
 
-Here are results for a [Apple M4 Pro](https://en.wikipedia.org/wiki/Apple_M4):
-
-| Backend | L hemi (s) | R hemi (s) | Total (s) | vs Python |
-|---------|-----------|-----------|-----------|-----------|
-| Python (numpy/BLAS) | ~35 | ~35 | 73 | 1.0x |
-| C CPU FP64 | 38.5 | 38.5 | 89 | 0.8x |
-| C CPU FP32 | 35.1 | 34.9 | 82 | 0.9x |
-| C Metal GPU FP32 | 53.9 | 54.8 | 121 | 0.6x |
+| Backend | Threads | L hemi (s) | R hemi (s) | Total (s) | vs Python |
+|---------|---------|-----------|-----------|-----------|-----------|
+| Python (numpy/Accelerate) | auto | 15.5 | 15.4 | 30.9 | 1.0x |
+| C CPU FP64 | 1 | 38.7 | 38.7 | 77.4 | 0.4x |
+| C CPU FP64 | 10 | 15.5 | 15.5 | 31.0 | 1.0x |
+| C CPU FP32 | 1 | 35.0 | 35.0 | 69.9 | 0.4x |
+| **C CPU FP32** | **10** | **14.4** | **14.4** | **28.8** | **1.1x** |
+| C Metal GPU FP32 | 1 | 44.7 | 45.1 | 89.8 | 0.3x |
+| C Metal GPU FP32 | 10 | 30.7 | 31.0 | 61.7 | 0.5x |
 
 All backends produce identical output (test-set vertex-wise correlation percentiles):
 
@@ -223,48 +234,50 @@ All backends produce identical output (test-set vertex-wise correlation percenti
 
 ### Analysis
 
-**Correctness**: All four backends produce numerically identical percentile distributions at 4 decimal places. The FP32 backends (CPU and Metal) match FP64 to this precision because the searchlight weight normalization and sparse accumulation are done in FP64 regardless of the local Procrustes precision.
+**Correctness**: All backends produce numerically identical percentile distributions at 4 decimal places. The FP32 backends (CPU and Metal) match FP64 because searchlight weight normalization and sparse accumulation are done in FP64 regardless of the local Procrustes precision.
 
-**Performance**: The Python baseline is competitive because it uses the same underlying BLAS (Apple Accelerate) and numpy's vectorized operations minimize Python overhead in the inner loop. The C implementation currently runs each searchlight serially. Key optimization opportunities:
+**Performance**: The Python baseline is fast because numpy calls Apple Accelerate which internally multithreads all BLAS calls across all cores. The Python `searchlight_procrustes` is a single-threaded `for` loop, but each `numpy.linalg.svd` call dispatches multithreaded BLAS underneath (controlled by `VECLIB_MAXIMUM_THREADS` on macOS).
 
-- **OpenMP parallelism**: The searchlight loop is embarrassingly parallel. Building with `make OPENMP=1` would parallelize across CPU cores (expected 4-8x speedup on multi-core).
-- **Metal batching**: The current Metal implementation submits one GPU command buffer per searchlight (~19K serial round-trips). Batching multiple searchlights per command buffer or pipelining submissions would amortize GPU dispatch overhead.
-- **Sparse matrix init**: The `ha_sparse_init` function allocates and sorts all (row, col) pairs, which takes a few seconds for ~19K searchlights. This could be cached or pre-computed.
+With 10 OpenMP threads, the C CPU FP32 backend (**28.8s**) is the fastest, edging out Python (**30.9s**). C CPU FP64 with 10 threads (31.0s) matches Python. Single-threaded C is 2-2.5x slower than Python, confirming that Python's speed comes from implicit Accelerate multithreading.
 
-The Metal backend is slower than CPU because the ~200x200 local matrices are too small for GPU dispatch overhead (~10μs per command buffer) to be amortized. GPU acceleration would become beneficial with either batched submissions or larger matrix sizes.
+**Metal GPU**: The Metal backend uses batched GPU GEMM (256 searchlights per command buffer) with CPU-GPU pipelining — while the GPU computes the next batch of `X^T @ Y` products, the CPU runs Newton iterations for the previous batch. OpenMP parallelizes the CPU Newton stage. Despite these optimizations, Metal is slower than CPU because the ~200x200 local matrices are too small for GPU dispatch overhead to be fully amortized.
+
+**OpenMP scaling** (M4 Pro, 10 performance cores):
+
+| Backend | 1 thread | 10 threads | Speedup |
+|---------|----------|------------|---------|
+| C CPU FP64 | 77.4s | 31.0s | 2.5x |
+| C CPU FP32 | 69.9s | 28.8s | 2.4x |
+| C Metal GPU FP32 | 89.8s | 61.7s | 1.5x |
+
+The sub-linear scaling (2.5x on 10 cores) is expected: each searchlight's local SVD/Newton calls LAPACK, which itself uses multiple Accelerate threads internally. The `#pragma omp critical` on scatter-add adds minimal overhead since the SVD computation dominates.
 
 ### Replicating on Other Machines
 
 **macOS (Apple Silicon)**:
 ```bash
-# All four backends available
-cd csrc && make && make test
-cd .. && python benchmark_neuroboros.py /path/to/data --backend metal
+cd csrc && make OPENMP=1 && make OPENMP=1 test
+cd .. && python benchmark_neuroboros.py /path/to/data --backend c32 --n-jobs 10 --repeat 3
 ```
 
 **macOS (Intel)**:
 ```bash
 # Metal available but may not have MPS support for all operations
 # CPU backends recommended
-cd csrc && make && make test
-cd .. && python benchmark_neuroboros.py /path/to/data --backend c64
+cd csrc && make OPENMP=1 && make OPENMP=1 test
+cd .. && python benchmark_neuroboros.py /path/to/data --backend c64 --n-jobs 4 --repeat 3
 ```
 
 **Linux (Ubuntu/Debian)**:
 ```bash
-# Install LAPACK/BLAS
-sudo apt install liblapack-dev libopenblas-dev
+# Install LAPACK/BLAS and OpenMP
+sudo apt install liblapack-dev libopenblas-dev libomp-dev
 
-# Build (Metal stubs are automatically provided; only CPU backends work)
-cd csrc && make && make test
+# Build with OpenMP (Metal stubs are automatic; only CPU backends work)
+cd csrc && make OPENMP=1 && make OPENMP=1 test
 
 # Run benchmark (metal backend will fall back to c32 automatically)
-cd .. && python benchmark_neuroboros.py /path/to/data --backend c64
-```
-
-**Linux with OpenMP**:
-```bash
-cd csrc && make OPENMP=1 && make test
+cd .. && python benchmark_neuroboros.py /path/to/data --backend c32 --n-jobs $(nproc) --repeat 3
 ```
 
 ## References

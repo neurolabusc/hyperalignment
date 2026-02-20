@@ -20,8 +20,8 @@ endif
 
 ifdef OPENMP
 	ifeq ($(UNAME),Darwin)
-		CFLAGS += -Xpreprocessor -fopenmp -I/opt/homebrew/include
-		LDFLAGS += -L/opt/homebrew/lib -lomp
+		CFLAGS += -Xpreprocessor -fopenmp -I/opt/homebrew/opt/libomp/include
+		LDFLAGS += -L/opt/homebrew/opt/libomp/lib -lomp
 	else
 		CFLAGS += -fopenmp
 		LDFLAGS += -fopenmp
@@ -57,7 +57,7 @@ $(SHARED_LIB): $(OBJS)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 %.o: %.m
-	$(CC) -O2 -Wall -Wextra -c $< -o $@
+	$(CC) -O2 -Wall -Wextra -fobjc-arc -c $< -o $@
 
 test: $(TEST)
 	./$(TEST)
