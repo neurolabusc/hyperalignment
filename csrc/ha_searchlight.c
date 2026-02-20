@@ -123,7 +123,7 @@ static int metal_process_batch(int32_t start, int32_t count,
 		if (rc == kHaSuccess) {
 			TMat *local_T = ha_mat_alloc(sz, sz);
 			if (!local_T) { free(T_f); error = kHaErrorAlloc; continue; }
-			for (int32_t j = 0; j < sz * sz; j++)
+			for (int64_t j = 0; j < (int64_t)sz * sz; j++)
 				local_T->data[j] = (double)T_f[j];
 
 			double *w = weights ? weights[s] : NULL;
@@ -291,13 +291,14 @@ int ha_searchlight_procrustes(const TMat *X, const TMat *Y,
 		for (int32_t i = 0; i < batch_count; i++) {
 			int32_t s = batch_start + i;
 			int32_t sz = sls_X->sizes[s];
+			int32_t sz_y = sls_Y_actual->sizes[s];
 			b_sizes[i] = sz;
 
 			TMat *lX = ha_mat_alloc(nt, sz);
-			TMat *lY = ha_mat_alloc(nt, sz);
+			TMat *lY = ha_mat_alloc(nt, sz_y);
 			if (!lX || !lY) { ha_mat_free(lX); ha_mat_free(lY); result = kHaErrorAlloc; break; }
 			ha_mat_extract_cols(X, sls_X->indices[s], sz, lX);
-			ha_mat_extract_cols(Y, sls_Y_actual->indices[s], sls_Y_actual->sizes[s], lY);
+			ha_mat_extract_cols(Y, sls_Y_actual->indices[s], sz_y, lY);
 
 			TMatF *fX = ha_mat_to_float(lX);
 			TMatF *fY = ha_mat_to_float(lY);

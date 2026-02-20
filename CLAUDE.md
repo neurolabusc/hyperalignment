@@ -325,6 +325,42 @@ The scatter-add from local transformations into the global sparse matrix require
 - Result buffer per searchlight, then reduce into sparse matrix on CPU (simpler than GPU atomics)
 - Apple Silicon and DGX Spark unified memory eliminates CPU-GPU transfer overhead — a significant advantage over discrete GPU architectures
 
+## Performance Notes
+
+### Pre-allocated workspace does NOT help (tested and reverted)
+
+We tried pre-allocating thread-local work buffers (`TProcWorkspace` structs holding all SVD/Procrustes scratch arrays) to eliminate ~145K malloc/free pairs per hemisphere. **Result: 3-5% regression, not improvement.** Root causes:
+
+1. **macOS magazine allocator is near-zero-cost** for repeated same-sized allocations — it recycles blocks via per-CPU free lists without system calls
+2. **Oversized buffers hurt L2 cache** — workspace sized for max searchlight (~300 verts, ~10 MB/thread) exceeds M4 Pro's 4 MB L2 per core, while per-call right-sized buffers (~200 verts, ~4 MB) fit better
+3. **SVD computation dominates** — LAPACK dgesdd/sgesdd is ~95%+ of runtime; allocation overhead is negligible
+
+**Do not re-attempt this optimization.** The per-searchlight malloc/free pattern is already efficient on macOS. The ~2.5x gap between Python and single-threaded C is due to Accelerate/numpy internal optimization (cache tiling, vectorized small-matrix paths), not allocation overhead.
+
+### Benchmark baselines (M4 Pro, 10P+4E cores, Forrest dataset, median of 3)
+
+| Backend | Threads | Total (s) | vs Python |
+|---------|---------|-----------|-----------|
+| Python (numpy/Accelerate) | auto | 30.9 | 1.0x |
+| C CPU FP64 | 1 | 77.4 | 0.4x |
+| C CPU FP64 | 10 | 31.0 | 1.0x |
+| C CPU FP32 | 1 | 69.9 | 0.4x |
+| **C CPU FP32** | **10** | **28.8** | **1.1x** |
+| C Metal GPU | 1 | 89.8 | 0.3x |
+| C Metal GPU | 10 | 61.7 | 0.5x |
+
+### Remaining optimization ceiling
+
+C FP32 10-thread (28.8s) already beats Python (30.9s) by 7%. Further gains are marginal:
+
+- **`#pragma omp critical` contention**: all scatter-adds serialize through one global lock. Fine-grained per-column locks or precomputed sparse offsets could help, but SVD is ~95% of runtime so <2% expected gain.
+- **`dgesvd` vs `dgesdd`**: divide-and-conquer (`dgesdd`) has setup overhead that may not pay off for N~200. QR-iteration (`dgesvd`) might be marginally faster for small matrices.
+- **CPU polar Newton (skip SVD)**: `ha_polar_newton` exists for Metal path. FP64 variant would need ~4-6 LU iterations, likely comparable to 1 SVD — no clear win.
+- **Linux may benefit from workspace pre-allocation**: glibc malloc is less efficient than macOS magazine allocator for this pattern.
+- **More threads**: M4 Pro has 14 cores (10P+4E). Using 14 instead of 10 might squeeze 10-15% more, but efficiency cores are slower.
+
+The 2.5x single-threaded gap vs Python is a numpy/Accelerate integration advantage (internal workspace caching, cache-optimized call patterns) that cannot be closed from external C code.
+
 ## Python ctypes Wrapper (`hyperalignment_c.py`)
 
 Loads `csrc/libhyperalignment.dylib` (or `.so`) via ctypes. Main function:
