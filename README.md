@@ -199,6 +199,7 @@ python -c "import neuroboros; neuroboros.Forrest()"
 
 # 4. Run benchmarks (3 repeats, report median)
 python benchmark_neuroboros.py /path/to/data --backend python --repeat 3
+VECLIB_MAXIMUM_THREADS=1 python benchmark_neuroboros.py /path/to/data --backend python --repeat 3
 python benchmark_neuroboros.py /path/to/data --backend c64  --n-jobs 1  --repeat 3
 python benchmark_neuroboros.py /path/to/data --backend c64  --n-jobs 10 --repeat 3
 python benchmark_neuroboros.py /path/to/data --backend c32  --n-jobs 1  --repeat 3
@@ -211,16 +212,16 @@ Options:
 - `--backend`: `python`, `c64`, `c32`, `metal`
 - `--n-jobs N`: Number of OpenMP threads for C backends (default: 1). Requires `OPENMP=1` build.
 - `--repeat N`: Number of alignment repeats (default: 1). Reports median when N > 1.
+- `VECLIB_MAXIMUM_THREADS=1`: Restrict Apple Accelerate to a single thread for the Python backend (macOS). Use `OPENBLAS_NUM_THREADS=1` or `MKL_NUM_THREADS=1` on Linux.
 
 On Linux, omit the `metal` backend (it will fall back to `c32` automatically).
 
 ### Results
 
-Hardware: Apple M4 Pro (10 performance + 4 efficiency cores), 48 GB unified memory, macOS.
-
 | Backend | Threads | L hemi (s) | R hemi (s) | Total (s) | vs Python |
 |---------|---------|-----------|-----------|-----------|-----------|
 | Python (numpy/Accelerate) | auto | 16.1 | 16.0 | 32.1 | 1.0x |
+| Python (numpy/Accelerate) | 1 | 15.2 | 15.1 | 30.2 | 1.1x |
 | C CPU FP64 | 1 | 28.1 | 28.2 | 56.3 | 0.6x |
 | **C CPU FP64** | **10** | **4.4** | **4.4** | **8.7** | **3.7x** |
 | C CPU FP32 | 1 | 24.6 | 24.5 | 49.0 | 0.7x |
@@ -237,7 +238,7 @@ All backends produce identical output (test-set vertex-wise correlation percenti
 
 **Correctness**: All backends produce numerically identical percentile distributions at 4 decimal places. The FP32 backends (CPU and Metal) match FP64 because searchlight weight normalization and accumulation are done in FP64 regardless of the local Procrustes precision.
 
-**Performance**: With 10 OpenMP threads, C CPU FP32 (**7.2s**) is **4.4x faster** than the Python baseline (**32.1s**). C CPU FP64 with 10 threads (**8.7s**) is **3.7x faster**. The Python baseline is single-threaded Python `for` loop where each `numpy.linalg.svd` dispatches multithreaded BLAS via Accelerate (controlled by `VECLIB_MAXIMUM_THREADS` on macOS). Single-threaded C is ~1.5-1.8x slower than Python due to Accelerate-internal optimizations (workspace caching, vectorized small-matrix paths) that external LAPACK callers cannot access.
+**Performance**: With 10 OpenMP threads, C CPU FP32 (**7.2s**) is **4.4x faster** than the Python baseline (**32.1s**). C CPU FP64 with 10 threads (**8.7s**) is **3.7x faster**. The Python baseline is a single-threaded Python `for` loop where each `numpy.linalg.svd` dispatches multithreaded BLAS via Accelerate. Setting `VECLIB_MAXIMUM_THREADS=1` restricts Accelerate to a single thread — the resulting 30.2s is nearly identical to the auto-threaded 32.1s, indicating that Accelerate's internal multithreading provides negligible benefit for the small (~200x200) per-searchlight SVDs. Single-threaded C is ~1.5-1.8x slower than Python due to Accelerate-internal optimizations (workspace caching, vectorized small-matrix paths) that external LAPACK callers cannot access.
 
 **Dense output**: The C library uses `ha_searchlight_procrustes_dense`, which takes flat concatenated arrays and accumulates into a dense transformation matrix using `#pragma omp atomic` for lock-free scatter-add — matching the approach used by the Python reference implementation. This avoids the overhead of sparse matrix construction (sorting and deduplicating all searchlight index pairs) and binary-search scatter-add that would otherwise dominate at high thread counts.
 
