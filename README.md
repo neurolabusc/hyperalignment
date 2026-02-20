@@ -216,15 +216,16 @@ On Linux, omit the `metal` backend (it will fall back to `c32` automatically).
 
 ### Results
 
+Hardware: Apple M4 Pro (10 performance + 4 efficiency cores), 48 GB unified memory, macOS.
+
 | Backend | Threads | L hemi (s) | R hemi (s) | Total (s) | vs Python |
 |---------|---------|-----------|-----------|-----------|-----------|
-| Python (numpy/Accelerate) | auto | 15.5 | 15.4 | 30.9 | 1.0x |
-| C CPU FP64 | 1 | 38.7 | 38.7 | 77.4 | 0.4x |
-| C CPU FP64 | 10 | 15.5 | 15.5 | 31.0 | 1.0x |
-| C CPU FP32 | 1 | 35.0 | 35.0 | 69.9 | 0.4x |
-| **C CPU FP32** | **10** | **14.4** | **14.4** | **28.8** | **1.1x** |
-| C Metal GPU FP32 | 1 | 44.7 | 45.1 | 89.8 | 0.3x |
-| C Metal GPU FP32 | 10 | 30.7 | 31.0 | 61.7 | 0.5x |
+| Python (numpy/Accelerate) | auto | 16.1 | 16.0 | 32.1 | 1.0x |
+| C CPU FP64 | 1 | 28.1 | 28.2 | 56.3 | 0.6x |
+| **C CPU FP64** | **10** | **4.4** | **4.4** | **8.7** | **3.7x** |
+| C CPU FP32 | 1 | 24.6 | 24.5 | 49.0 | 0.7x |
+| **C CPU FP32** | **10** | **3.6** | **3.6** | **7.2** | **4.4x** |
+| C Metal GPU FP32 | 10 | 20.7 | 21.2 | 41.8 | 0.8x |
 
 All backends produce identical output (test-set vertex-wise correlation percentiles):
 
@@ -234,23 +235,22 @@ All backends produce identical output (test-set vertex-wise correlation percenti
 
 ### Analysis
 
-**Correctness**: All backends produce numerically identical percentile distributions at 4 decimal places. The FP32 backends (CPU and Metal) match FP64 because searchlight weight normalization and sparse accumulation are done in FP64 regardless of the local Procrustes precision.
+**Correctness**: All backends produce numerically identical percentile distributions at 4 decimal places. The FP32 backends (CPU and Metal) match FP64 because searchlight weight normalization and accumulation are done in FP64 regardless of the local Procrustes precision.
 
-**Performance**: The Python baseline is fast because numpy calls Apple Accelerate which internally multithreads all BLAS calls across all cores. The Python `searchlight_procrustes` is a single-threaded `for` loop, but each `numpy.linalg.svd` call dispatches multithreaded BLAS underneath (controlled by `VECLIB_MAXIMUM_THREADS` on macOS).
+**Performance**: With 10 OpenMP threads, C CPU FP32 (**7.2s**) is **4.4x faster** than the Python baseline (**32.1s**). C CPU FP64 with 10 threads (**8.7s**) is **3.7x faster**. The Python baseline is single-threaded Python `for` loop where each `numpy.linalg.svd` dispatches multithreaded BLAS via Accelerate (controlled by `VECLIB_MAXIMUM_THREADS` on macOS). Single-threaded C is ~1.5-1.8x slower than Python due to Accelerate-internal optimizations (workspace caching, vectorized small-matrix paths) that external LAPACK callers cannot access.
 
-With 10 OpenMP threads, the C CPU FP32 backend (**28.8s**) is the fastest, edging out Python (**30.9s**). C CPU FP64 with 10 threads (31.0s) matches Python. Single-threaded C is 2-2.5x slower than Python, confirming that Python's speed comes from implicit Accelerate multithreading.
+**Dense output**: The C library uses `ha_searchlight_procrustes_dense`, which takes flat concatenated arrays and accumulates into a dense transformation matrix using `#pragma omp atomic` for lock-free scatter-add — matching the approach used by the Python reference implementation. This avoids the overhead of sparse matrix construction (sorting and deduplicating all searchlight index pairs) and binary-search scatter-add that would otherwise dominate at high thread counts.
 
-**Metal GPU**: The Metal backend uses batched GPU GEMM (256 searchlights per command buffer) with CPU-GPU pipelining — while the GPU computes the next batch of `X^T @ Y` products, the CPU runs Newton iterations for the previous batch. OpenMP parallelizes the CPU Newton stage. Despite these optimizations, Metal is slower than CPU because the ~200x200 local matrices are too small for GPU dispatch overhead to be fully amortized.
+**Metal GPU**: The Metal backend uses batched GPU GEMM (256 searchlights per command buffer) with CPU-GPU pipelining — while the GPU computes the next batch of `X^T @ Y` products, the CPU runs Newton iterations for the previous batch. OpenMP parallelizes the CPU Newton stage. Despite these optimizations, Metal is slower than CPU because the ~200x200 local matrices are too small for GPU dispatch overhead to be fully amortized, and Metal Performance Shaders does not provide SVD — requiring an iterative Newton approach with multiple LU factorizations per searchlight.
 
 **OpenMP scaling** (M4 Pro, 10 performance cores):
 
 | Backend | 1 thread | 10 threads | Speedup |
 |---------|----------|------------|---------|
-| C CPU FP64 | 77.4s | 31.0s | 2.5x |
-| C CPU FP32 | 69.9s | 28.8s | 2.4x |
-| C Metal GPU FP32 | 89.8s | 61.7s | 1.5x |
+| C CPU FP64 | 56.3s | 8.7s | 6.5x |
+| C CPU FP32 | 49.0s | 7.2s | 6.8x |
 
-The sub-linear scaling (2.5x on 10 cores) is expected: each searchlight's local SVD/Newton calls LAPACK, which itself uses multiple Accelerate threads internally. The `#pragma omp critical` on scatter-add adds minimal overhead since the SVD computation dominates.
+Scaling is sub-linear (6.5-6.8x on 10 cores) because each searchlight's local SVD calls LAPACK, which itself uses some Accelerate threads internally.
 
 ### Replicating on Other Machines
 
