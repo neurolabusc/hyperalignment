@@ -13,7 +13,7 @@ Finds the rotation (with optional reflection and scaling) that minimizes `||XT -
 SVD-based ridge regression with regularization parameter `alpha`. Solves via damped singular values: `d = s / (alpha + s^2)`. Includes grid search over multiple alpha values and PC counts, with cross-validated ensemble averaging.
 
 ### Searchlight
-Applies alignment locally within overlapping brain surface searchlights, then combines transformations using distance-based or uniform weighting. Each searchlight's local transformation is computed independently (Procrustes or ridge), then accumulated into a global sparse transformation matrix with weights normalized to sum to 1 at each vertex.
+Applies alignment locally within overlapping brain surface searchlights, then combines transformations using distance-based or uniform weighting. Each searchlight's local transformation is computed independently (Procrustes or ridge), then accumulated into a global dense transformation matrix with weights normalized to sum to 1 at each vertex.
 
 ### Template Construction
 Builds a common representational space from multiple subjects via:
@@ -168,18 +168,19 @@ import hyperalignment_c as hac
 
 W = hac.searchlight_procrustes(
     X, Y, sls, dists, radius,
-    backend='cpu64'  # or 'cpu32', 'metal'
+    backend='cpu64',  # or 'cpu32', 'metal'
+    n_jobs=10,        # OpenMP threads (requires OPENMP=1 build)
 )
-# W is a scipy.sparse.csc_matrix
+# W is a dense (nv, nv) numpy array
 ```
 
-The wrapper handles all memory management: numpy arrays are passed to C by pointer (zero-copy for the input matrices), and the sparse result is copied into a scipy CSC matrix before freeing the C allocations.
+The wrapper converts input matrices to Fortran (column-major) order for cache-efficient column extraction in C, builds flat searchlight index arrays via vectorized numpy ops, and passes everything to C in a single call. The dense output matrix is allocated in Python and written directly by C (zero-copy).
 
 ## Benchmarks
 
 ### Setup
 
-Benchmarked on the StudyForrest dataset (Hanke et al., 2014) via `neuroboros`: 2 subjects, 4 training runs, 4 test runs, radius-20mm searchlights (~9,670 searchlights per hemisphere, ~19,341 cortical vertices per hemisphere). The benchmark runs searchlight Procrustes alignment on both hemispheres and evaluates vertex-wise correlation between aligned and target timeseries.
+Benchmarked on the StudyForrest dataset (Hanke et al., 2014) via `neuroboros`: 2 subjects, 4 training runs, 4 test runs, radius-20mm searchlights (~9,675 searchlights per hemisphere, ~9,675 cortical vertices per hemisphere). The benchmark runs searchlight Procrustes alignment on both hemispheres and evaluates vertex-wise correlation between aligned and target timeseries.
 
 Hardware: Apple M4 Pro (10 performance + 4 efficiency cores), 48 GB unified memory, macOS.
 
@@ -199,7 +200,7 @@ python -c "import neuroboros; neuroboros.Forrest()"
 
 # 4. Run benchmarks (3 repeats, report median)
 python benchmark_neuroboros.py /path/to/data --backend python --repeat 3
-VECLIB_MAXIMUM_THREADS=1 python benchmark_neuroboros.py /path/to/data --backend python --repeat 3
+VECLIB_MAXIMUM_THREADS=10 python benchmark_neuroboros.py /path/to/data --backend python --repeat 3
 python benchmark_neuroboros.py /path/to/data --backend c64  --n-jobs 1  --repeat 3
 python benchmark_neuroboros.py /path/to/data --backend c64  --n-jobs 10 --repeat 3
 python benchmark_neuroboros.py /path/to/data --backend c32  --n-jobs 1  --repeat 3
@@ -212,21 +213,23 @@ Options:
 - `--backend`: `python`, `c64`, `c32`, `metal`
 - `--n-jobs N`: Number of OpenMP threads for C backends (default: 1). Requires `OPENMP=1` build.
 - `--repeat N`: Number of alignment repeats (default: 1). Reports median when N > 1.
-- `VECLIB_MAXIMUM_THREADS=1`: Restrict Apple Accelerate to a single thread for the Python backend (macOS). Use `OPENBLAS_NUM_THREADS=1` or `MKL_NUM_THREADS=1` on Linux.
+- `VECLIB_MAXIMUM_THREADS=N`: Control Apple Accelerate internal thread count for the Python backend (macOS). Use `OPENBLAS_NUM_THREADS=N` or `MKL_NUM_THREADS=N` on Linux.
 
 On Linux, omit the `metal` backend (it will fall back to `c32` automatically).
 
 ### Results
 
+Hardware: Apple M4 Pro (10 performance cores + 4 efficiency cores), 48 GB unified memory, macOS.
+
 | Backend | Threads | L hemi (s) | R hemi (s) | Total (s) | vs Python |
 |---------|---------|-----------|-----------|-----------|-----------|
-| Python (numpy/Accelerate) | auto | 16.1 | 16.0 | 32.1 | 1.0x |
-| Python (numpy/Accelerate) | 1 | 15.2 | 15.1 | 30.2 | 1.1x |
-| C CPU FP64 | 1 | 28.1 | 28.2 | 56.3 | 0.6x |
-| **C CPU FP64** | **10** | **4.4** | **4.4** | **8.7** | **3.7x** |
-| C CPU FP32 | 1 | 24.6 | 24.5 | 49.0 | 0.7x |
-| **C CPU FP32** | **10** | **3.6** | **3.6** | **7.2** | **4.4x** |
-| C Metal GPU FP32 | 10 | 20.7 | 21.2 | 41.8 | 0.8x |
+| Python (numpy/Accelerate) | 1 | 15.1 | 15.0 | 30.1 | 1.0x |
+| Python (numpy/Accelerate) | 10 | 15.4 | 15.4 | 30.8 | 0.98x |
+| C CPU FP64 | 1 | 14.4 | 14.6 | 28.9 | 1.04x |
+| **C CPU FP64** | **10** | **2.2** | **2.2** | **4.3** | **7.0x** |
+| C CPU FP32 | 1 | 9.3 | 9.2 | 18.5 | 1.6x |
+| **C CPU FP32** | **10** | **1.25** | **1.24** | **2.5** | **12.0x** |
+| C Metal GPU FP32 | 10 | 8.3 | 8.4 | 16.8 | 1.8x |
 
 All backends produce identical output (test-set vertex-wise correlation percentiles):
 
@@ -238,20 +241,22 @@ All backends produce identical output (test-set vertex-wise correlation percenti
 
 **Correctness**: All backends produce numerically identical percentile distributions at 4 decimal places. The FP32 backends (CPU and Metal) match FP64 because searchlight weight normalization and accumulation are done in FP64 regardless of the local Procrustes precision.
 
-**Performance**: With 10 OpenMP threads, C CPU FP32 (**7.2s**) is **4.4x faster** than the Python baseline (**32.1s**). C CPU FP64 with 10 threads (**8.7s**) is **3.7x faster**. The Python baseline is a single-threaded Python `for` loop where each `numpy.linalg.svd` dispatches multithreaded BLAS via Accelerate. Setting `VECLIB_MAXIMUM_THREADS=1` restricts Accelerate to a single thread — the resulting 30.2s is nearly identical to the auto-threaded 32.1s, indicating that Accelerate's internal multithreading provides negligible benefit for the small (~200x200) per-searchlight SVDs. Single-threaded C is ~1.5-1.8x slower than Python due to Accelerate-internal optimizations (workspace caching, vectorized small-matrix paths) that external LAPACK callers cannot access.
+**Performance**: With 10 OpenMP threads, C CPU FP32 (**2.5s**) is **12x faster** than the Python baseline (**30.1s**). C CPU FP64 with 10 threads (**4.3s**) is **7x faster**. Even single-threaded, C FP64 (28.9s) slightly outperforms Python (30.1s), and C FP32 (18.5s) is 1.6x faster. The Python baseline is a single-threaded Python `for` loop calling numpy/scipy (which dispatch to Accelerate for BLAS/LAPACK). Setting `VECLIB_MAXIMUM_THREADS=10` for the Python backend has no measurable effect (~30.8s) because Accelerate's internal multithreading provides negligible benefit for the small (~121x121) per-searchlight SVDs.
+
+**Column-major input**: The Python `hyperalignment` package produces Fortran-contiguous (column-major) data matrices from `np.concatenate`. The searchlight indices are highly scattered across vertices (mean gap ~80, spanning the full vertex array), so row-major column extraction requires ~220K scattered reads per searchlight, thrashing the CPU cache. The C wrapper converts input to Fortran order (`np.asfortranarray`) so the C library can extract searchlight columns via contiguous `memcpy` — this alone accounts for a 2x speedup over the naive row-major approach.
 
 **Dense output**: The C library uses `ha_searchlight_procrustes_dense`, which takes flat concatenated arrays and accumulates into a dense transformation matrix using `#pragma omp atomic` for lock-free scatter-add — matching the approach used by the Python reference implementation. This avoids the overhead of sparse matrix construction (sorting and deduplicating all searchlight index pairs) and binary-search scatter-add that would otherwise dominate at high thread counts.
 
-**Metal GPU**: The Metal backend uses batched GPU GEMM (256 searchlights per command buffer) with CPU-GPU pipelining — while the GPU computes the next batch of `X^T @ Y` products, the CPU runs Newton iterations for the previous batch. OpenMP parallelizes the CPU Newton stage. Despite these optimizations, Metal is slower than CPU because the ~200x200 local matrices are too small for GPU dispatch overhead to be fully amortized, and Metal Performance Shaders does not provide SVD — requiring an iterative Newton approach with multiple LU factorizations per searchlight.
+**Metal GPU**: The Metal backend uses batched GPU GEMM (256 searchlights per command buffer) with CPU-GPU pipelining — while the GPU computes the next batch of `X^T @ Y` products, the CPU runs Newton iterations for the previous batch. OpenMP parallelizes the CPU Newton stage. Despite these optimizations, Metal is slower than CPU because the ~121x121 local matrices are too small for GPU dispatch overhead to be fully amortized, and Metal Performance Shaders does not provide SVD — requiring an iterative Newton approach with multiple LU factorizations per searchlight.
 
 **OpenMP scaling** (M4 Pro, 10 performance cores):
 
 | Backend | 1 thread | 10 threads | Speedup |
 |---------|----------|------------|---------|
-| C CPU FP64 | 56.3s | 8.7s | 6.5x |
-| C CPU FP32 | 49.0s | 7.2s | 6.8x |
+| C CPU FP64 | 28.9s | 4.3s | 6.7x |
+| C CPU FP32 | 18.5s | 2.5s | 7.4x |
 
-Scaling is sub-linear (6.5-6.8x on 10 cores) because each searchlight's local SVD calls LAPACK, which itself uses some Accelerate threads internally.
+Scaling is sub-linear (6.7-7.4x on 10 cores) due to memory bandwidth contention and Accelerate-internal threading within individual LAPACK calls.
 
 ### Replicating on Other Machines
 

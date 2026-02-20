@@ -46,6 +46,7 @@ Follow the style in `dcm/` (dcm2niix codebase):
 - `double` for all FP64 computation (matching Python float64)
 - `float` for FP32 compute paths (CPU FP32, Metal GPU) — FP32 types use `TMatF` and `*_f32` function suffixes
 - `bool` from `<stdbool.h>`
+- `ha_lapack_int` for LAPACK integer arguments (`__LAPACK_int` on macOS, `int` on Linux)
 
 ### Memory
 - `malloc`/`free` exclusively (no C++ `new`/`delete`)
@@ -55,23 +56,23 @@ Follow the style in `dcm/` (dcm2niix codebase):
 
 ### Error Handling
 - Return `NULL` for pointer-returning functions on failure
-- Return `int` error codes (0 = success) for void-like functions
+- Return `int` error codes: `kHaSuccess` (0), `kHaErrorAlloc` (-1), `kHaErrorSvd` (-2), `kHaErrorArg` (-3), `kHaErrorInternal` (-4)
 - Print errors to stderr via `fprintf(stderr, ...)`
 - No `exit()` calls in library code; only in CLI main
 
 ## Core Data Structures
 
 ```c
-// Dense matrix — FP64 (row-major for LAPACK compatibility with transpose)
+// Dense matrix — FP64 (row-major, data[i * cols + j])
 typedef struct {
     double *data;
-    int32_t rows, cols, stride;
+    int32_t rows, cols;
 } TMat;
 
 // Dense matrix — FP32 (for CPU FP32 and Metal backends)
 typedef struct {
     float *data;
-    int32_t rows, cols, stride;
+    int32_t rows, cols;
 } TMatF;
 
 // Sparse CSC matrix (matches scipy.sparse.csc_matrix)
@@ -83,7 +84,7 @@ typedef struct {
     int64_t nnz;
 } TSparseCSC;
 
-// Searchlight definition
+// Searchlight definition (pointer-of-pointers, used by sparse API)
 typedef struct {
     int32_t **indices;
     double **dists;     // NULL for uniform weighting
@@ -100,24 +101,24 @@ typedef enum {
 } THaBackend;
 ```
 
-Precision conversion helpers: `ha_mat_to_float()` (TMat→TMatF) and `ha_matf_to_double()` (TMatF→TMat) in `ha_common.h`.
+Precision conversion helpers: `ha_mat_to_float()` (TMat->TMatF) and `ha_matf_to_double()` (TMatF->TMat) in `ha_common.h`.
 
 ## Algorithm-to-Function Mapping
 
-| Python | C (FP64) | C (FP32) | Core Operation |
-|--------|----------|----------|---------------|
-| `safe_svd(X)` | `ha_svd()` | `ha_svd_f32()` | LAPACK `dgesdd`/`sgesdd`, fallback `dgesvd`/`sgesvd` |
-| `svd_pca(X)` | `ha_pca()` | — | SVD then `U * s` |
-| `procrustes(X, Y)` | `ha_procrustes()` | `ha_procrustes_f32()` | `A = Y'X`, SVD of A, `T = U @ Vt` |
-| — | — | `ha_procrustes_metal()` | Polar decomposition via Newton iteration (GPU) |
-| `ridge(X, Y, alpha)` | `ha_ridge()` | — | SVD of X, damped solve |
-| `ridge_grid(...)` | `ha_ridge_grid()` | — | Vectorized over alpha/npc grid |
-| `initialize_sparse_matrix(sls)` | `ha_sparse_init()` | — | Build CSC sparsity pattern |
-| `compute_searchlight_weights(sls)` | `ha_searchlight_weights()` | — | Distance-based weighting |
-| `searchlight_procrustes(...)` | `ha_searchlight_procrustes()` | (dispatches via `THaBackend`) | Loop: local align + sparse accumulate |
-| `searchlight_ridge(...)` | `ha_searchlight_ridge()` | — | Loop: local ridge + sparse accumulate |
-| `compute_template(dss)` | `ha_template()` | — | Iterative Procrustes/GPA/PCA |
-| `compute_ensemble_indices(nt)` | `ha_ensemble_indices()` | — | Block permutation CV splits |
+| Python | C Function | Core Operation |
+|--------|-----------|---------------|
+| `safe_svd(X)` | `ha_svd()` / `ha_svd_f32()` | LAPACK `dgesdd`/`sgesdd`, fallback `dgesvd`/`sgesvd` |
+| `svd_pca(X)` | `ha_pca()` | SVD then `U * s` |
+| `procrustes(X, Y)` | `ha_procrustes()` / `ha_procrustes_f32()` | `A = X'Y`, SVD of A, `T = U @ Vt` |
+| — | `ha_polar_newton()` | FP32 polar decomposition via Newton iteration (Metal path) |
+| `ridge(X, Y, alpha)` | `ha_ridge()` | SVD of X, damped solve |
+| `ridge_grid(...)` | `ha_ridge_grid()` | Vectorized over alpha/npc grid |
+| `compute_searchlight_weights(sls)` | `ha_searchlight_weights()` | Distance-based weighting |
+| `searchlight_procrustes(...)` | **`ha_searchlight_procrustes_dense()`** | **Primary entry point**: flat arrays, dense output, OMP atomic scatter-add |
+| `searchlight_procrustes(...)` | `ha_searchlight_procrustes()` | Legacy sparse API: TSearchlights input, sparse CSC output |
+| `searchlight_ridge(...)` | `ha_searchlight_ridge()` | Loop: local ridge + sparse accumulate |
+| `compute_template(dss)` | `ha_template()` | Iterative Procrustes/GPA/PCA |
+| `compute_ensemble_indices(nt)` | `ha_ensemble_indices()` | Block permutation CV splits |
 
 ## Build System
 
@@ -127,17 +128,18 @@ Uses Make with platform detection. Links against Accelerate on macOS, system LAP
 csrc/
     Makefile              Platform-detecting build system (static + shared library)
     hyperalignment.h      Umbrella header (includes all modules + ha_metal.h)
-    ha_common.h           Types (TMat, TMatF, TSparseCSC, TSearchlights, THaBackend), alloc helpers
-    ha_linalg.h/c         SVD FP64 (dgesdd/dgesvd), SVD FP32 (sgesdd/sgesvd), PCA, z-score
-    ha_procrustes.h/c     Procrustes FP64 + FP32
+    ha_common.h           Types, alloc helpers, extract/scatter utilities
+    ha_linalg.h/c         SVD FP64/FP32, PCA, z-score
+    ha_procrustes.h/c     Procrustes FP64/FP32 + polar Newton (CPU)
     ha_ridge.h/c          Ridge regression, grid search, ensemble ridge
-    ha_sparse.h/c         CSC sparse matrix init from searchlight patterns, scatter-add
-    ha_searchlight.h/c    Searchlight weights, alignment loops with THaBackend dispatch
+    ha_sparse.h/c         CSC sparse matrix init, scatter-add (legacy path)
+    ha_searchlight.h/c    Searchlight weights, dense+sparse alignment loops, workspace structs
     ha_template.h/c       Template construction (Procrustes, GPA, PCA)
     ha_ensemble.h/c       Cross-validation index generation
     ha_metal.h            Metal API header (inline stubs on non-Apple)
     ha_metal.m            Metal/MPS implementation (macOS only, Objective-C)
     ha_test.c             Test harness (2621 tests)
+    bench_*.c             Microbenchmarks (SVD, pipeline, extraction, column-major)
 ```
 
 ### Build commands
@@ -147,6 +149,7 @@ make                  # Release build -> libhyperalignment.a + .dylib/.so
 make test             # Build and run tests
 make DEBUG=1 test     # Build with AddressSanitizer and run tests
 make OPENMP=1         # Build with OpenMP searchlight parallelism
+make OPENMP=1 test    # Build with OpenMP and run tests
 make clean
 ```
 
@@ -156,18 +159,169 @@ make clean
 - `-framework Accelerate -framework Metal -framework MetalPerformanceShaders -framework Foundation` on macOS
 - `-llapack -lblas -lm` on Linux
 - OpenMP opt-in via `OPENMP=1` flag
-
-### Row-major SVD trick
-Row-major `X(M,N)` is column-major `X^T(N,M)` to LAPACK. We call `dgesdd("S", N, M, ...)` and swap the U/Vt buffer assignments: LAPACK's "U" output becomes our Vt, LAPACK's "Vt" output becomes our U. No explicit transpose needed.
+  - macOS: `-Xpreprocessor -fopenmp` + homebrew libomp
+  - Linux: `-fopenmp`
 
 ## LAPACK/BLAS Functions Used
 
-FP64: `dgesdd_`/`dgesvd_` (SVD), `dgemm_` (GEMM), `dgemv_` (matvec), `dnrm2_`, `dscal_`, `dcopy_`
-FP32: `sgesdd_`/`sgesvd_` (SVD), `cblas_sgemm` (GEMM), `sgetrf_`/`sgetri_` (LU inverse, used in Metal Newton iteration), `cblas_sger`, `cblas_sscal`
+FP64: `dgesdd_`/`dgesvd_` (SVD), `cblas_dgemm` (GEMM), `dgemv_` (matvec), `dnrm2_`, `cblas_dscal`, `dcopy_`, `dgetrf_` (LU, for det sign check), `cblas_dger` (rank-1 update, for reflection correction)
+FP32: `sgesdd_`/`sgesvd_` (SVD), `cblas_sgemm` (GEMM), `sgetrf_`/`sgetri_` (LU inverse, for Metal Newton and det sign), `cblas_sger`, `cblas_sscal`
 
-## GPU Implementation Status
+Both `CblasRowMajor` and `CblasColMajor` layouts are used — see "Column-Major Optimization" below.
 
-### Metal GPU Backend (Implemented)
+### Row-major SVD trick
+Row-major `X(M,N)` is column-major `X^T(N,M)` to LAPACK. We call `dgesdd("S", N, M, ...)` and swap the U/Vt buffer assignments: LAPACK's "U" output becomes our Vt, LAPACK's "Vt" output becomes our U. No explicit transpose needed. Used by `procrustes_ws_fp64()` and `procrustes_ws_fp32()`.
+
+### Column-major (native LAPACK) path
+When `col_major=true`, data is already in LAPACK's native column-major layout. No U/Vt swap trick needed — pass `dgesdd("S", N, N, ...)` with standard U/Vt ordering. CBLAS calls use `CblasColMajor`. Used by `procrustes_ws_fp64_cm()` and `procrustes_ws_fp32_cm()`. This is the primary path used by the Python wrapper.
+
+## Primary C Entry Point: `ha_searchlight_procrustes_dense`
+
+This is the optimized entry point used by the Python wrapper. It replaces the older sparse API with a single-call dense-output design.
+
+```c
+int ha_searchlight_procrustes_dense(
+    const double *X_data, const double *Y_data,    // nt x nv matrices
+    int32_t nt, int32_t nv,
+    const int32_t *sl_indices,   // flat concatenated vertex indices
+    const int32_t *sl_offsets,   // offsets into sl_indices, length count+1
+    const double *sl_dists,      // flat concatenated distances (NULL = uniform)
+    int32_t count,               // number of searchlights
+    double radius,
+    double *T_out,               // pre-allocated nv x nv, caller zero-inits
+    bool isReflection, bool isScaling,
+    THaBackend backend,
+    bool col_major);             // true = Fortran order input (preferred)
+```
+
+### Design decisions
+- **Flat arrays** (`sl_indices` + `sl_offsets`) instead of pointer-of-pointers (`TSearchlights`). Built via `np.concatenate` + `np.cumsum` in Python — no per-searchlight Python loop.
+- **Dense output** (`T_out` nv x nv) instead of sparse CSC. Scatter-add uses `#pragma omp atomic` per element — lock-free, no contention at typical sparsity levels.
+- **Column-major input** (`col_major=true`): Python data from `np.concatenate` is naturally F-contiguous. Column-major extraction is contiguous `memcpy` per column vs scattered reads in row-major. This alone gives a **2x speedup** (see Performance Notes).
+- **Internal weight computation**: Two-pass over flat arrays to compute normalized weights. No per-searchlight malloc.
+- **Per-thread workspace**: `WorkspaceFP64`/`WorkspaceFP32` structs pre-allocate all SVD/Procrustes scratch buffers once per thread at max searchlight size. Eliminates ~310K malloc/free pairs per hemisphere.
+
+## Per-Thread Workspace Pattern
+
+Defined in `ha_searchlight.c`. Each thread gets a pre-allocated workspace sized for the largest searchlight:
+
+```c
+typedef struct {
+    double *local_X;         // nt x max_sz
+    double *local_Y;         // nt x max_sz
+    double *T;               // max_sz x max_sz
+    double *A;               // max_sz x max_sz (cross-correlation, destroyed by SVD)
+    double *U, *s, *Vt;     // SVD outputs
+    double *svd_backup;      // max_sz x max_sz (dgesdd fallback copy)
+    double *svd_work;        // LAPACK workspace (queried at alloc time)
+    ha_lapack_int *svd_iwork; // 8 * max_sz
+    ha_lapack_int svd_lwork;
+    double *det_tmp;         // max_sz x max_sz (LU for reflection check)
+    ha_lapack_int *det_ipiv; // max_sz
+} WorkspaceFP64;
+```
+
+Allocated once per thread before the OMP parallel loop, freed after. LAPACK workspace size is queried via `dgesdd` with `lwork=-1` at allocation time to get the optimal size. `WorkspaceFP32` is the float equivalent.
+
+Inline Procrustes functions (`procrustes_ws_fp64`, `procrustes_ws_fp64_cm`, `procrustes_ws_fp32`, `procrustes_ws_fp32_cm`) operate directly on workspace buffers — no TMat structs, no malloc, no free in the hot loop.
+
+## Actual Searchlight Dimensions (Forrest Dataset)
+
+These are the real numbers from the benchmark dataset (StudyForrest, radius=20mm, `neuroboros` package):
+
+| Property | Value |
+|----------|-------|
+| Vertices per hemisphere | ~9,675 |
+| Searchlights per hemisphere | ~9,675 (one per vertex) |
+| Timepoints (4 training runs) | 1,818 |
+| Median searchlight size | 121 vertices |
+| Max searchlight size | ~170 vertices |
+| Local matrices | ~121 x 121 (median) |
+| Dense output matrix | 9,675 x 9,675 = ~749 MB |
+| Searchlight indices | Highly scattered: mean gap ~80, span ~9,500/9,675, only 1.2% consecutive |
+
+Previous CLAUDE.md references to "~200x200 matrices" or "~19K searchlights" were incorrect. The per-searchlight SVD is on ~121x121 matrices.
+
+## Performance: Current State of the Art
+
+### Benchmark Results (Apple M4 Pro, Forrest Dataset, Median of 3)
+
+Hardware: Apple M4 Pro (10 performance + 4 efficiency cores), 48 GB unified memory, macOS.
+
+| Backend | Threads | L hemi (s) | R hemi (s) | Total (s) | vs Python |
+|---------|---------|-----------|-----------|-----------|-----------|
+| Python (numpy/Accelerate) | 1 | 15.1 | 15.0 | 30.1 | 1.0x |
+| Python (numpy/Accelerate) | 10 | 15.4 | 15.4 | 30.8 | 0.98x |
+| C CPU FP64 | 1 | 14.4 | 14.6 | 28.9 | 1.04x |
+| **C CPU FP64** | **10** | **2.2** | **2.2** | **4.3** | **7.0x** |
+| C CPU FP32 | 1 | 9.3 | 9.2 | 18.5 | 1.6x |
+| **C CPU FP32** | **10** | **1.25** | **1.24** | **2.5** | **12.0x** |
+| C Metal GPU FP32 | 10 | 8.3 | 8.4 | 16.8 | 1.8x |
+
+All backends produce numerically identical percentile distributions at 4 decimal places. FP32 backends match FP64 because weight normalization and scatter-add accumulation are done in FP64 regardless of local Procrustes precision.
+
+Python "Threads" column: 1 = default, 10 = `VECLIB_MAXIMUM_THREADS=10`. No measurable effect because Accelerate internal threading provides negligible benefit for ~121x121 per-searchlight SVDs.
+
+### OpenMP Scaling (M4 Pro, 10 performance cores)
+
+| Backend | 1 thread | 10 threads | Speedup |
+|---------|----------|------------|---------|
+| C CPU FP64 | 28.9s | 4.3s | 6.7x |
+| C CPU FP32 | 18.5s | 2.5s | 7.4x |
+
+Sub-linear scaling (6.7-7.4x on 10 cores) due to memory bandwidth contention and Accelerate-internal threading within individual LAPACK calls.
+
+### Key Optimizations (in order of impact)
+
+#### 1. Column-Major Input (2x single-threaded speedup)
+
+**The single most impactful optimization.** The Python `hyperalignment` package produces Fortran-contiguous (column-major) data from `np.concatenate`. The C wrapper calls `np.asfortranarray()` and passes `col_major=true`.
+
+Why it matters: searchlight indices are highly scattered (mean gap ~80 across ~9,675 vertices). With row-major data, extracting columns for one searchlight requires ~121 x 1,818 = ~220K scattered reads across 75KB-wide rows, thrashing the CPU cache. With column-major data, each column is contiguous in memory — extraction is `memcpy` per column.
+
+Measured impact: single-threaded C went from ~54s (row-major) to ~29s (column-major), matching Python's ~30s.
+
+Column-major extraction:
+```c
+// Col-major: column j is contiguous at X_data[sl[j]*nt], length nt
+for (int32_t j = 0; j < sz; j++) {
+    memcpy(&ws->local_X[j * nt], &X_data[(size_t)sl[j] * nt],
+           (size_t)nt * sizeof(double));
+}
+```
+
+#### 2. Dense Output with OMP Atomic (~2x multi-threaded speedup)
+
+Replaced sparse CSC output (`ha_sparse_init` qsort + binary-search scatter-add + `#pragma omp critical`) with dense output (direct indexed scatter-add + `#pragma omp atomic`). The sparse infrastructure was the dominant bottleneck at high thread counts due to the global critical section serializing all scatter-adds.
+
+```c
+for (int32_t i = 0; i < sz; i++) {
+    for (int32_t j = 0; j < sz; j++) {
+        double val = ws->T[j * sz + i] * w[i];  // col-major T
+        #pragma omp atomic
+        T_out[sl[i] * nv + sl[j]] += val;
+    }
+}
+```
+
+#### 3. Per-Thread Workspace Pre-allocation
+
+Eliminated ~310K malloc/free pairs per hemisphere by pre-allocating all SVD/Procrustes scratch buffers per thread. Each `WorkspaceFP64`/`WorkspaceFP32` is allocated once at the max searchlight size before the OMP parallel loop. LAPACK workspace size is queried via `lwork=-1` at allocation time.
+
+Note: a previous attempt at workspace pre-allocation was reverted because it was tested without the column-major optimization. With column-major input, the workspace approach is strictly beneficial since the allocation savings are on top of the already-fast extraction.
+
+#### 4. Flat-Array API (eliminates Python loop)
+
+The dense entry point takes flat concatenated arrays (`sl_indices` + `sl_offsets`) instead of pointer-of-pointers. Python builds these with vectorized numpy ops:
+```python
+sizes = np.array([len(s) for s in sls], dtype=np.int32)
+offsets = np.zeros(len(sls) + 1, dtype=np.int32)
+np.cumsum(sizes, out=offsets[1:])
+all_indices = np.concatenate(sls).astype(np.int32)
+```
+This replaces a 9,675-iteration Python loop with per-element ctypes calls.
+
+## Metal GPU Backend (macOS, Completed)
 
 The Metal backend (`ha_metal.m`) computes Procrustes alignment via **polar decomposition using Newton iteration**, avoiding SVD entirely:
 
@@ -177,28 +331,13 @@ X_{k+1} = (X_k + X_k^{-T}) / 2        (CPU LAPACK inverse + transpose, ~6-10 ite
 T = X_converged                          (orthogonal polar factor)
 ```
 
-**Architecture**: GPU GEMM for the initial `X^T @ Y` multiplication, then CPU LAPACK (`sgetrf_`/`sgetri_`) for the Newton iteration inverse (small ~200x200 matrices where GPU dispatch overhead dominates). Falls back to `ha_procrustes_f32` (CPU FP32 SVD) if the matrix is singular.
+**Architecture**: GPU GEMM for the initial `X^T @ Y` multiplication, CPU LAPACK (`sgetrf_`/`sgetri_`) for Newton iteration inverse (~121x121 matrices where GPU dispatch overhead dominates). Falls back to `ha_procrustes_f32` (CPU FP32 SVD) if singular.
 
-**Key implementation detail**: `matrix_inverse_cpu` passes row-major data to column-major LAPACK, so it returns `A^{-1}` (not `A^{-T}`). An explicit `transpose_inplace()` is needed after the inverse to get `A^{-T}` for Newton iteration correctness.
+**Implementation detail**: `matrix_inverse_cpu` passes row-major data to column-major LAPACK, so it returns `A^{-1}` (not `A^{-T}`). An explicit `transpose_inplace()` is needed after the inverse to get `A^{-T}` for Newton iteration correctness.
 
-**Current performance**: Slower than CPU (~121s vs ~73s Python) because each of the ~19K searchlights submits a separate GPU command buffer (~10µs dispatch overhead each). Optimization opportunity: batch multiple searchlights per command buffer or pipeline submissions.
+**Batching and pipelining** (implemented): 256 searchlights per GPU command buffer (`METAL_BATCH_DENSE`). While the GPU computes the next batch of `X^T @ Y` products, the CPU runs Newton iterations for the previous batch. OpenMP parallelizes the CPU Newton stage.
 
-### Benchmark Results (Forrest dataset, Apple M3 Max)
-
-| Backend | Total (s) | vs Python |
-|---------|-----------|-----------|
-| Python (numpy/BLAS) | 73 | 1.0x |
-| C CPU FP64 | 89 | 0.8x |
-| C CPU FP32 | 82 | 0.9x |
-| C Metal GPU FP32 | 121 | 0.6x |
-
-All backends produce numerically identical percentile distributions at 4 decimal places. FP32 backends match FP64 because searchlight weight normalization and sparse accumulation are done in FP64 regardless.
-
-### Metal Optimization TODO
-
-- **Command buffer batching**: Submit multiple searchlights per GPU command buffer to amortize dispatch overhead
-- **Pipeline submissions**: Overlap GPU execution with CPU sparse accumulation
-- **Pre-cached sparse init**: `ha_sparse_init` sorts all (row, col) pairs (~few seconds for ~19K searchlights), could be cached
+**Performance**: 16.8s total (1.8x vs Python). Slower than CPU because ~121x121 matrices are too small for GPU dispatch overhead to be fully amortized, and the iterative Newton approach requires multiple LU factorizations per searchlight.
 
 ### Apple Accelerate Does NOT Use the GPU
 Accelerate's BLAS/LAPACK runs exclusively on the CPU via Apple Silicon's AMX coprocessor. GPU acceleration requires Metal Performance Shaders (MPS).
@@ -206,171 +345,93 @@ Accelerate's BLAS/LAPACK runs exclusively on the CPU via Apple Silicon's AMX cop
 ### MPS Capabilities
 MPS provides GPU-accelerated GEMM (`MPSMatrixMultiplication`), Cholesky, LU (`MPSMatrixDecompositionLU`), and triangular solve (`MPSMatrixSolveTriangular`). MPS does **NOT** provide SVD — this is why we use polar decomposition for Procrustes and why ridge regression has no Metal backend.
 
-### Future: GPU SVD Strategy (for Ridge and General Use)
-Since there is no GPU SVD in MPS, options for algorithms that require full SVD (ridge regression):
-- **One-sided Jacobi SVD** in a custom Metal compute shader — parallelizes well for our small matrices (~200x200), each searchlight gets one threadgroup
-- **Eigendecomposition approach**: compute `A^T A`, GPU eigensolver (Jacobi), then recover singular vectors — avoids full SVD but loses some numerical precision
-- **Hybrid CPU/GPU**: keep SVD on CPU (Accelerate), offload GEMM and scatter-add to GPU — viable because Apple Silicon unified memory has zero copy cost
+## CUDA Path (Linux/NVIDIA) — Research Notes
 
-### Existing GPU SVD Research
-- [Ringoot et al. (2025)](https://arxiv.org/abs/2508.06339) — first portable GPU SVD on Metal (Julia/KernelAbstractions.jl). However, computes **singular values only** (no vectors), **no batched mode**, and optimized for large matrices (poor performance <256x256). Not suitable for our workload.
-- [philipturner GEMM kernel](https://gist.github.com/philipturner/84f613a5cc745460a914d2c6ad226131) — optimized Metal GEMM (FP32/FP16/BF16, no FP64). Useful reference for custom Metal shader patterns but does not address SVD.
+Target hardware for upcoming Linux testing: AMD Threadripper (96 cores / 192 threads) + NVIDIA RTX 4090.
 
-### CUDA Path (Linux/NVIDIA) — Detailed Audit
+### RTX 4090 Specs
+- 16,384 CUDA cores, 24 GB GDDR6X
+- ~82.6 TFLOPS FP32, **~1.3 TFLOPS FP64** (1:64 ratio — consumer GPUs heavily deprioritize FP64)
+- PCIe 4.0 x16 (~25 GB/s bidirectional)
+- Compute capability 8.9 (Ada Lovelace)
 
-Our workload: ~10,000 independent searchlight problems, each involving SVD + GEMM on ~200x200 matrices, followed by sparse scatter-add into a global transformation matrix.
+FP64 is extremely slow on consumer GPUs. The FP32 path (local Procrustes in FP32, accumulation in FP64 on CPU) is mandatory.
 
-#### cuSOLVER SVD — The Critical Constraint
+### Our Workload on CUDA
+~9,675 independent searchlight problems per hemisphere, each: extract ~121 columns from 1818 x 9675 matrix, compute 121x121 SVD + GEMM, scatter-add into 9675x9675 dense output.
 
-cuSOLVER provides three SVD methods:
+### cuSOLVER SVD — The Critical Constraint
 
-1. **`cusolverDnDgesvdjBatched`** — Batched Jacobi SVD. Launches all matrices in one kernel. **Hard size limit: m ≤ 32 and n ≤ 32.** Our searchlights are ~200x200, so this is **NOT usable** for our workload.
-   - [NVIDIA gesvdjBatched sample code](https://github.com/NVIDIA/CUDALibrarySamples/tree/master/cuSOLVER/gesvdjBatched)
-   - [Forum discussion on 32x32 limit](https://forums.developer.nvidia.com/t/the-origin-of-the-m-32-and-n-32-limitations-in-gesvdjbatched/266434)
+1. **`cusolverDnSgesvdjBatched`** — Batched Jacobi SVD. **Hard size limit: m <= 32 and n <= 32.** Our searchlights are ~121x121, so **NOT usable**.
 
-2. **`cusolverDnDgesvdj`** — Non-batched Jacobi SVD. No size limit, works on larger matrices. The Jacobi method applies up to n/2 non-overlapping Givens rotations in parallel and converges quadratically (typically 3-4 sweeps). However, it is **effectively synchronous** — concurrent launches on separate CUDA streams [do not overlap](https://forums.developer.nvidia.com/t/cusolver-svd-not-overlapping-using-streams/306782). This means we cannot trivially parallelize 10,000 SVDs on the GPU using streams.
-   - [GTC 2019: Fast SVD on GPUs](https://developer.nvidia.com/gtc/2019/video/s9226)
+2. **`cusolverDnSgesvdj`** — Non-batched Jacobi SVD. No size limit, but **effectively synchronous** per stream. Cannot trivially parallelize 9,675 SVDs using streams.
 
-3. **`cusolverDnDgesvdaStridedBatched`** — Approximate SVD (polar decomposition-based), strided batched. No documented size limit like gesvdjBatched. Computes only the top-k singular values/vectors, not full SVD. May be suitable if we only need the leading singular components (which is true for our low-rank Procrustes problems). Requires testing for numerical accuracy vs full SVD.
-   - [cuSOLVER documentation](https://docs.nvidia.com/cuda/cusolver/index.html)
+3. **`cusolverDnSgesvdaStridedBatched`** — Approximate SVD (polar decomposition-based), strided batched. No documented size limit. Computes top-k singular values/vectors. For Procrustes we need all singular vectors (T = U @ Vt), so k must equal matrix dimension — needs accuracy validation at k=121.
 
-4. **`cusolverDnDgesvd`** — QR-based SVD (same algorithm as LAPACK). No size limit but slower than Jacobi for small matrices and also synchronous per-stream.
+4. **`cusolverDnSgesvd`** — QR-based SVD. No size limit but slower than Jacobi and synchronous.
 
-**Bottom line for SVD**: Unlike what we initially assumed, cuSOLVER does NOT provide a drop-in batched SVD for 200x200 matrices. The batched API is limited to 32x32. For our workload, viable strategies are:
-- **Approximate batched SVD** (`gesvdaStridedBatched`) — if top-k singular components suffice (likely yes for Procrustes where we use all of U @ Vt, but the approximation quality needs validation)
-- **Custom one-sided Jacobi SVD kernel** — same approach needed for Metal, achieves true batched parallelism for any matrix size
-- **Hybrid CPU/GPU** — SVD on CPU, GEMM and scatter-add on GPU (viable on unified memory systems like DGX Spark; costly on discrete GPUs due to PCIe transfers)
-- **Concurrent streams** — launch non-batched `gesvdj` on multiple streams. Limited by synchronous behavior, but may still achieve some occupancy overlap on modern GPUs
+**Bottom line**: cuSOLVER does NOT provide a drop-in batched SVD for 121x121 matrices. Viable strategies:
+- **`gesvdaStridedBatched`** with k=121 — test accuracy first
+- **Custom one-sided Jacobi SVD kernel** — true batched parallelism, any size
+- **CPU-only with Threadripper**: 96 cores may be fast enough that GPU SVD is unnecessary. At M4 Pro's 7.4x scaling on 10 cores, 96 cores could yield ~50-70x if scaling holds, putting total time under 0.5s. Memory bandwidth is the likely limiter.
 
-#### cuBLAS Batched GEMM — Fully Capable
+### cuBLAS Batched GEMM — Fully Capable
 
-[`cublasDgemmBatched`](https://docs.nvidia.com/cuda/cublas/index.html) and `cublasDgemmStridedBatched` have **no size limits** and work well for small matrices. This covers all our GEMM operations:
-- `A = X^T @ Y` (cross-correlation for Procrustes)
+`cublasSgemmStridedBatched` has no size limits and works well for our ~121x121 matrices. Covers:
+- `A = X^T @ Y` (cross-correlation)
 - `T = U @ Vt` (transformation assembly)
-- `X_aligned = X @ T` (applying transformations)
 
-The strided batched variant (`cublasDgemmStridedBatched`) avoids pointer-array overhead and is preferred when matrices are packed contiguously.
+### Dense Scatter-Add on GPU
 
-Reference: [cuBLAS Strided Batched Matrix Multiply](https://developer.nvidia.com/blog/cublas-strided-batched-matrix-multiply/)
+Our dense output pattern (accumulate 121x121 local T blocks into overlapping regions of 9675x9675 matrix) requires atomic operations. CUDA `atomicAdd` on `double` is supported since compute capability 6.0 (RTX 4090 is 8.9). A simple custom kernel can parallelize this.
 
-#### cuSPARSE — Partial Coverage
+### Discrete GPU: PCIe Transfer Strategy
 
-[cuSPARSE](https://docs.nvidia.com/cuda/cusparse/index.html) supports CSC/CSR formats with SpMM and SpMV operations, 30-150x faster than CPU for sparse matrix-dense vector/matrix operations. However:
-- **No built-in scatter-add with atomics** — our pattern (accumulate local transformations into overlapping regions of a global sparse matrix) requires a custom CUDA kernel with `atomicAdd` on double-precision values
-- cuSPARSE is useful for the *final* sparse matrix-dense matrix multiply (`X @ T_sparse`), but not for building the sparse matrix itself
+RTX 4090 is a discrete GPU — data must be explicitly copied:
+- Subject data: 1818 timepoints x 9675 vertices x 8 bytes = ~141 MB per subject
+- Output: 9675 x 9675 x 8 bytes = ~749 MB
+- PCIe 4.0: ~25 GB/s — transfer overhead is ~36ms for subject data, negligible vs compute
 
-#### Discrete GPU: PCIe Transfer Overhead
+**Key insight**: Transfer subject data + searchlight indices to GPU once, do ALL computation on GPU, transfer result back once. No per-searchlight transfers. This requires solving the batched SVD problem on GPU, OR doing CPU-only with Threadripper.
 
-For discrete GPUs (most CUDA-capable cards), data must be explicitly copied between host and device memory:
-- **PCIe 3.0 x16**: ~12 GB/s bidirectional
-- **PCIe 4.0 x16**: ~25 GB/s bidirectional
-- **PCIe 5.0 x16**: ~64 GB/s bidirectional
-- **Per-transfer latency**: ~10-30 µs overhead per `cudaMemcpy` call
+### Threadripper Strategy (96 cores / 192 threads)
 
-For our workload, the data to transfer per hemisphere:
-- Subject data: 500 timepoints × 40,000 vertices × 8 bytes = ~160 MB per subject
-- Searchlight extraction + results: comparable in size
-- If SVD stays on CPU in a hybrid approach, intermediate results must bounce back and forth — PCIe becomes the bottleneck
+The existing OpenMP code should work directly with OpenBLAS on Linux. Key considerations:
+- **NUMA topology**: Threadrippers are typically 2-socket or multi-die. Thread pinning (`OMP_PROC_BIND=close`) may be important.
+- **Memory bandwidth**: Each searchlight workspace is ~121x121 x 8 x ~12 buffers = ~1.4 MB per thread. 192 threads x 1.4 MB = ~269 MB total workspace — fits in L3 but may pressure bandwidth.
+- **OpenBLAS threading**: Set `OPENBLAS_NUM_THREADS=1` to avoid nested parallelism (OpenMP outer loop + BLAS inner threads). This is critical — same issue as `VECLIB_MAXIMUM_THREADS` on macOS.
+- **Scaling prediction**: M4 Pro gets 7.4x on 10 cores (FP32). 96 cores could yield ~50-70x if memory bandwidth allows. Sub-linear scaling is expected.
 
-**Implication**: On discrete GPUs, the hybrid CPU/GPU approach (SVD on CPU, GEMM on GPU) is impractical due to per-searchlight transfer overhead. Everything must stay on GPU, which means solving the batched SVD problem is mandatory.
+### Recommended CUDA Strategy for RTX 4090
 
-Reference: [How to Optimize Data Transfers in CUDA](https://developer.nvidia.com/blog/how-optimize-data-transfers-cuda-cc/)
+1. **Try CPU-only first**: Threadripper 96 cores with OpenMP may be fast enough. Build with `make OPENMP=1`, run with `OMP_NUM_THREADS=96`. If total time is under ~1s, GPU acceleration has diminishing returns.
 
-#### DGX Spark: Unified Memory Advantage
+2. **If GPU needed**: Use FP32 path. Pre-extract all searchlight submatrices into contiguous batched buffer on GPU. Try `cusolverDnSgesvdaStridedBatched` first (easiest, test accuracy). If insufficient, write custom Jacobi SVD kernel. Use `cublasSgemmStridedBatched` for GEMMs. Custom kernel for dense scatter-add with `atomicAdd`.
 
-The [DGX Spark](https://www.nvidia.com/en-us/products/workstations/dgx-spark/) (Grace Blackwell GB10) uses unified memory, similar to Apple Silicon:
-- **128 GB LPDDR5x** shared coherently between CPU (20 Arm cores) and GPU (6,144 CUDA cores, 192 Tensor cores)
-- **~273 GB/s** shared memory bandwidth (vs ~64 GB/s for PCIe 5.0 x16)
-- **No explicit `cudaMemcpy` needed** — both CPU and GPU access the same address space via hardware coherence
-- CUDA 13.0, Blackwell architecture
+3. **Hybrid as last resort**: SVD on CPU (96 Threadripper cores), GEMM on GPU. Requires PCIe round-trips for intermediate data — only viable if SVD dominates and GPU GEMM savings outweigh transfer cost.
 
-This makes the **hybrid CPU/GPU approach viable** on DGX Spark — SVD on CPU (Arm NEON + system LAPACK), GEMM on GPU (cuBLAS), zero-copy data sharing. Same architectural advantage as Apple Silicon.
+### GPU SVD Research References
 
-References:
-- [DGX Spark Unified Memory Architecture](https://deepwiki.com/NVIDIA/dgx-spark-playbooks/9.1-unified-memory-architecture)
-- [DGX Spark Hardware Overview](https://docs.nvidia.com/dgx/dgx-spark/hardware.html)
-- [DGX Spark In-Depth Review (LMSYS)](https://lmsys.org/blog/2025-10-13-nvidia-dgx-spark/)
-
-#### CUDA vs Metal — Summary Comparison
-
-| Capability | CUDA | Metal/MPS |
-|------------|------|-----------|
-| **Batched SVD** | Only ≤32x32 (`gesvdjBatched`); approximate batched available (`gesvdaStridedBatched`) | Not available — custom Jacobi shader needed |
-| **Non-batched SVD** | `gesvdj` (Jacobi, any size, but synchronous per-stream) | Not available |
-| **Batched GEMM** | `cublasDgemmStridedBatched` — no limits | `MPSMatrixMultiplication` — no limits |
-| **Sparse ops** | cuSPARSE for SpMM/SpMV; custom kernel for scatter-add | Custom Metal compute shader |
-| **Unified memory** | DGX Spark only; discrete GPUs need explicit transfers | All Apple Silicon (M1+) |
-| **Peak TFLOPS (FP64)** | DGX Spark ~1 PFLOP (FP4), FP64 TBD; high-end discrete (A100): ~9.7 TFLOPS | M4 Max GPU: ~2-7 TFLOPS |
-
-#### Recommended CUDA Strategy
-
-1. **Discrete GPU (most common)**: Must keep everything on GPU. Use `cusolverDnDgesvdaStridedBatched` (approximate batched SVD) if accuracy is acceptable, or write a custom one-sided Jacobi SVD kernel. Use `cublasDgemmStridedBatched` for all GEMMs. Custom kernel for sparse scatter-add with `atomicAdd`.
-
-2. **DGX Spark (unified memory)**: Hybrid approach — SVD on CPU (system LAPACK), batched GEMM on GPU (cuBLAS), sparse accumulation on CPU. Zero-copy via unified memory. Simpler to implement, avoids the batched SVD problem entirely.
-
-3. **Both architectures**: Pre-extract all searchlight submatrices into contiguous batched buffers for coalesced GPU memory access. One kernel launch for all GEMMs, one for all SVDs (if batched).
-
-### Searchlight Parallelism
-The searchlight loop iterates over ~10,000 independent local problems (each a small SVD + GEMM on ~200x200 matrices). This maps naturally to:
-- **CUDA (discrete)**: Custom batched SVD kernel or `gesvdaStridedBatched` + `cublasDgemmStridedBatched` — all searchlights in one or two kernel launches
-- **CUDA (DGX Spark)**: CPU SVD (LAPACK) + GPU batched GEMM (cuBLAS) — hybrid via unified memory
-- **Metal**: Custom Jacobi SVD compute shader dispatching one threadgroup per searchlight + `MPSMatrixMultiplication`
-
-### Sparse Accumulation
-The scatter-add from local transformations into the global sparse matrix requires atomic operations on GPU. Each searchlight writes to a (sl_size x sl_size) block of the sparse matrix, with overlapping searchlights causing write conflicts. On CUDA, use `atomicAdd` (double-precision supported since compute capability 6.0). On Metal, use `atomic_fetch_add_explicit`. Alternative: per-searchlight result buffers, then reduce into sparse matrix on CPU (simpler, avoids atomics).
-
-### Memory Layout
-- Searchlight data should be packed contiguously for coalesced GPU memory access
-- Pre-extract all searchlight submatrices into a batched buffer before launching GPU kernels
-- Result buffer per searchlight, then reduce into sparse matrix on CPU (simpler than GPU atomics)
-- Apple Silicon and DGX Spark unified memory eliminates CPU-GPU transfer overhead — a significant advantage over discrete GPU architectures
-
-## Performance Notes
-
-### Pre-allocated workspace does NOT help (tested and reverted)
-
-We tried pre-allocating thread-local work buffers (`TProcWorkspace` structs holding all SVD/Procrustes scratch arrays) to eliminate ~145K malloc/free pairs per hemisphere. **Result: 3-5% regression, not improvement.** Root causes:
-
-1. **macOS magazine allocator is near-zero-cost** for repeated same-sized allocations — it recycles blocks via per-CPU free lists without system calls
-2. **Oversized buffers hurt L2 cache** — workspace sized for max searchlight (~300 verts, ~10 MB/thread) exceeds M4 Pro's 4 MB L2 per core, while per-call right-sized buffers (~200 verts, ~4 MB) fit better
-3. **SVD computation dominates** — LAPACK dgesdd/sgesdd is ~95%+ of runtime; allocation overhead is negligible
-
-**Do not re-attempt this optimization.** The per-searchlight malloc/free pattern is already efficient on macOS. The ~2.5x gap between Python and single-threaded C is due to Accelerate/numpy internal optimization (cache tiling, vectorized small-matrix paths), not allocation overhead.
-
-### Benchmark baselines (M4 Pro, 10P+4E cores, Forrest dataset, median of 3)
-
-| Backend | Threads | Total (s) | vs Python |
-|---------|---------|-----------|-----------|
-| Python (numpy/Accelerate) | auto | 32.1 | 1.0x |
-| C CPU FP64 | 1 | 56.3 | 0.6x |
-| **C CPU FP64** | **10** | **8.7** | **3.7x** |
-| C CPU FP32 | 1 | 49.0 | 0.7x |
-| **C CPU FP32** | **10** | **7.2** | **4.4x** |
-| C Metal GPU | 10 | 41.8 | 0.8x |
-
-### Dense output was a major win
-
-Switching from sparse CSC output (ha_sparse_init + binary-search scatter-add + omp critical) to dense output (direct indexed scatter-add + omp atomic) gave a 3-4x speedup for multi-threaded runs. The sparse infrastructure — not SVD — was the dominant bottleneck at high thread counts. The `ha_sparse_init` qsort of Σ(sz²) pairs and the global `#pragma omp critical` lock were the main culprits. The Python reference implementation already used dense output — we just matched its approach in C.
-
-### Remaining optimization ceiling
-
-At 7.2s (C FP32 10-thread), the breakdown is roughly: ~5s SVD, ~1s column extraction + float conversion, ~1s scatter-add + thread overhead. SVD is the hard floor. Marginal gains possible:
-
-- **Skip double↔float round-trip in CPU32**: direct float extraction from double matrix. ~0.3-0.5s.
-- **14 threads instead of 10**: E-cores are slower but could help. ~10-15%.
-- **Metal**: bottlenecked by CPU Newton iteration (no GPU SVD in MPS). Would need custom Metal compute shaders for small-matrix SVD — big project, uncertain payoff.
-
-The single-threaded gap (C 49s vs Python 32s) is Accelerate-internal optimization we can't close, but it's irrelevant since multi-threaded C is 4.4x faster.
+- [NVIDIA gesvdjBatched 32x32 limit](https://forums.developer.nvidia.com/t/the-origin-of-the-m-32-and-n-32-limitations-in-gesvdjbatched/266434)
+- [cuSOLVER SVD not overlapping on streams](https://forums.developer.nvidia.com/t/cusolver-svd-not-overlapping-using-streams/306782)
+- [GTC 2019: Fast SVD on GPUs](https://developer.nvidia.com/gtc/2019/video/s9226)
+- [cuSOLVER documentation](https://docs.nvidia.com/cuda/cusolver/index.html)
+- [cuBLAS Strided Batched GEMM](https://developer.nvidia.com/blog/cublas-strided-batched-matrix-multiply/)
+- [Ringoot et al. (2025)](https://arxiv.org/abs/2508.06339) — portable GPU SVD on Metal (Julia), singular values only, poor for <256x256
+- [philipturner Metal GEMM kernel](https://gist.github.com/philipturner/84f613a5cc745460a914d2c6ad226131) — FP32/FP16/BF16 reference
 
 ## Python ctypes Wrapper (`hyperalignment_c.py`)
 
 Loads `csrc/libhyperalignment.dylib` (or `.so`) via ctypes. Main function:
 ```python
-searchlight_procrustes(X, Y, sls, dists, radius, backend='cpu64', reflection=True, scaling=False)
+searchlight_procrustes(X, Y, sls, dists, radius, backend='cpu64',
+                       reflection=True, scaling=False, n_jobs=1)
 # Returns dense numpy ndarray (nv x nv)
 ```
 
-Uses `ha_searchlight_procrustes_dense` — a single C call that takes flat numpy arrays (concatenated searchlight indices + offsets) and writes into a caller-provided dense output matrix. Weights are computed internally. No sparse structure, no pointer-of-pointers, no per-searchlight memory management.
+Uses `ha_searchlight_procrustes_dense` — a single C call that takes flat numpy arrays and writes into a caller-provided dense output matrix. Weights are computed internally. No sparse structure, no pointer-of-pointers, no per-searchlight memory management.
+
+Input is converted to Fortran order (`np.asfortranarray`) so C can extract searchlight columns via contiguous memcpy. Output is zero-copy — numpy owns the buffer, C writes directly into it.
 
 **Installed vs source API difference**: The installed `hyperalignment` package has `searchlight_procrustes(X, Y, sls, dists, radius, ...)` while the source in `src/` has a different signature `(X, Y, sls, sls_Y=None, mat0=None, ...)`. The benchmark uses the installed API.
 
@@ -388,13 +449,14 @@ pytest tests/
 
 # C tests (2621 deterministic tests covering all modules and all three backends)
 make -C csrc test
-make -C csrc DEBUG=1 test   # with AddressSanitizer
+make -C csrc DEBUG=1 test       # with AddressSanitizer
+make -C csrc OPENMP=1 test      # with OpenMP
 
 # Real-data benchmark (requires neuroboros + Forrest dataset)
-python benchmark_neuroboros.py /path/to/data --backend python   # Python baseline
-python benchmark_neuroboros.py /path/to/data --backend c64      # C CPU FP64
-python benchmark_neuroboros.py /path/to/data --backend c32      # C CPU FP32
-python benchmark_neuroboros.py /path/to/data --backend metal    # Metal GPU FP32
+python benchmark_neuroboros.py /path/to/data --backend python --repeat 3
+python benchmark_neuroboros.py /path/to/data --backend c64  --n-jobs 10 --repeat 3
+python benchmark_neuroboros.py /path/to/data --backend c32  --n-jobs 10 --repeat 3
+python benchmark_neuroboros.py /path/to/data --backend metal --n-jobs 10 --repeat 3
 ```
 
 Key invariant: SVD is unique up to sign flips of singular vector columns, so compare `abs(U_c)` vs `abs(U_py)` or compare the reconstructed matrix `U @ diag(s) @ Vt`.

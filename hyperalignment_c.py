@@ -56,6 +56,7 @@ _lib.ha_searchlight_procrustes_dense.argtypes = [
     ctypes.c_bool,                     # isReflection
     ctypes.c_bool,                     # isScaling
     ctypes.c_int,                      # backend (THaBackend)
+    ctypes.c_bool,                     # col_major
 ]
 
 # Metal init/cleanup
@@ -134,9 +135,11 @@ def searchlight_procrustes(X, Y, sls, dists, radius, backend="cpu64",
     if n_jobs > 0:
         _lib.ha_set_num_threads(n_jobs)
 
-    # Ensure contiguous float64
-    X = np.ascontiguousarray(X, dtype=np.float64)
-    Y = np.ascontiguousarray(Y, dtype=np.float64)
+    # Use Fortran (column-major) order for efficient column extraction in C.
+    # Column-major means each column of X/Y is contiguous in memory, so
+    # extracting searchlight columns is a memcpy instead of scattered reads.
+    X = np.asfortranarray(X, dtype=np.float64)
+    Y = np.asfortranarray(Y, dtype=np.float64)
     nt, nv = X.shape
 
     # Build flat arrays from searchlight lists (vectorized numpy ops)
@@ -177,6 +180,7 @@ def searchlight_procrustes(X, Y, sls, dists, radius, backend="cpu64",
         ctypes.c_bool(reflection),
         ctypes.c_bool(scaling),
         ctypes.c_int(backend_enum),
+        ctypes.c_bool(True),  # col_major=True (data is Fortran-order)
     )
 
     if metal_inited:
