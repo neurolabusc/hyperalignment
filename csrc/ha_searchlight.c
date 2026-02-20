@@ -388,6 +388,358 @@ cleanup:
 	#undef METAL_BATCH
 }
 
+// ---- Dense output: flat-array input, no sparse structure ----
+
+// Process a batch of Newton iterations + dense scatter-add (Metal pipeline)
+static int metal_process_batch_dense(int32_t start, int32_t count,
+                                      const int32_t *sizes,
+                                      float **Xdata, float **Ydata, float **Adata,
+                                      const int32_t *sl_indices,
+                                      const int32_t *sl_offsets,
+                                      const double *weights,
+                                      double *T_out, int32_t nv,
+                                      bool isReflection, bool isScaling, int32_t nt) {
+	int error = kHaSuccess;
+	#ifdef _OPENMP
+	#pragma omp parallel for schedule(dynamic, 1)
+	#endif
+	for (int32_t i = 0; i < count; i++) {
+		if (error != kHaSuccess) continue;
+		int32_t s = start + i;
+		int32_t sz = sizes[i];
+		float *T_f = (float *)malloc((size_t)sz * sz * sizeof(float));
+		if (!T_f) { error = kHaErrorAlloc; continue; }
+
+		int rc = ha_polar_newton(Adata[i], T_f, sz,
+		                         isReflection, isScaling,
+		                         Xdata[i], nt);
+		if (rc != kHaSuccess) {
+			TMatF fX_s = { Xdata[i], nt, sz };
+			TMatF fY_s = { Ydata[i], nt, sz };
+			TMatF fT_s = { T_f, sz, sz };
+			rc = ha_procrustes_f32(&fX_s, &fY_s, &fT_s, isReflection, isScaling);
+		}
+
+		if (rc == kHaSuccess) {
+			int32_t off = sl_offsets[s];
+			const int32_t *sl = &sl_indices[off];
+			const double *w = &weights[off];
+			for (int32_t ii = 0; ii < sz; ii++) {
+				int32_t row = sl[ii];
+				double wi = w[ii];
+				for (int32_t jj = 0; jj < sz; jj++) {
+					double val = (double)T_f[ii * sz + jj] * wi;
+					#ifdef _OPENMP
+					#pragma omp atomic
+					#endif
+					T_out[row * nv + sl[jj]] += val;
+				}
+			}
+		} else {
+			error = rc;
+		}
+		free(T_f);
+	}
+	return error;
+}
+
+int ha_searchlight_procrustes_dense(
+    const double *X_data, const double *Y_data,
+    int32_t nt, int32_t nv,
+    const int32_t *sl_indices,
+    const int32_t *sl_offsets,
+    const double *sl_dists,
+    int32_t count,
+    double radius,
+    double *T_out,
+    bool isReflection, bool isScaling,
+    THaBackend backend)
+{
+	if (!X_data || !Y_data || !sl_indices || !sl_offsets || !T_out)
+		return kHaErrorArg;
+	if (nt <= 0 || nv <= 0 || count <= 0)
+		return kHaErrorArg;
+
+	int32_t total_elems = sl_offsets[count];
+
+	// ---- Compute flat weights array ----
+	double *vert_wsum = (double *)calloc((size_t)nv, sizeof(double));
+	double *weights = (double *)malloc((size_t)total_elems * sizeof(double));
+	if (!vert_wsum || !weights) {
+		free(vert_wsum); free(weights);
+		return kHaErrorAlloc;
+	}
+
+	if (sl_dists == NULL) {
+		for (int32_t k = 0; k < total_elems; k++)
+			vert_wsum[sl_indices[k]] += 1.0;
+		for (int32_t s = 0; s < count; s++) {
+			int32_t off = sl_offsets[s];
+			int32_t sz = sl_offsets[s + 1] - off;
+			for (int32_t i = 0; i < sz; i++)
+				weights[off + i] = 1.0 / vert_wsum[sl_indices[off + i]];
+		}
+	} else {
+		for (int32_t k = 0; k < total_elems; k++) {
+			double w = (radius - sl_dists[k]) / radius;
+			vert_wsum[sl_indices[k]] += w;
+		}
+		for (int32_t s = 0; s < count; s++) {
+			int32_t off = sl_offsets[s];
+			int32_t sz = sl_offsets[s + 1] - off;
+			for (int32_t i = 0; i < sz; i++) {
+				double w = (radius - sl_dists[off + i]) / radius;
+				weights[off + i] = w / vert_wsum[sl_indices[off + i]];
+			}
+		}
+	}
+	free(vert_wsum);
+
+	// Wrap raw pointers in TMat for ha_mat_extract_cols
+	// Cast away const -- extract_cols only reads from src
+	TMat X_mat = { (double *)X_data, nt, nv };
+	TMat Y_mat = { (double *)Y_data, nt, nv };
+
+	// ---- CPU FP64 path ----
+	if (backend == kHaBackendCPU64) {
+		int error = kHaSuccess;
+		#ifdef _OPENMP
+		#pragma omp parallel for schedule(dynamic, 1)
+		#endif
+		for (int32_t s = 0; s < count; s++) {
+			if (error != kHaSuccess) continue;
+			int32_t off = sl_offsets[s];
+			int32_t sz = sl_offsets[s + 1] - off;
+			const int32_t *sl = &sl_indices[off];
+
+			TMat *local_X = ha_mat_alloc(nt, sz);
+			TMat *local_Y = ha_mat_alloc(nt, sz);
+			TMat *local_T = ha_mat_alloc(sz, sz);
+			if (!local_X || !local_Y || !local_T) {
+				ha_mat_free(local_X); ha_mat_free(local_Y); ha_mat_free(local_T);
+				error = kHaErrorAlloc;
+				continue;
+			}
+
+			ha_mat_extract_cols(&X_mat, sl, sz, local_X);
+			ha_mat_extract_cols(&Y_mat, sl, sz, local_Y);
+
+			int rc = ha_procrustes(local_X, local_Y, local_T, isReflection, isScaling);
+			ha_mat_free(local_X);
+			ha_mat_free(local_Y);
+			if (rc != kHaSuccess) {
+				ha_mat_free(local_T);
+				error = rc;
+				continue;
+			}
+
+			const double *w = &weights[off];
+			for (int32_t i = 0; i < sz; i++) {
+				int32_t row = sl[i];
+				double wi = w[i];
+				for (int32_t j = 0; j < sz; j++) {
+					double val = local_T->data[i * sz + j] * wi;
+					#ifdef _OPENMP
+					#pragma omp atomic
+					#endif
+					T_out[row * nv + sl[j]] += val;
+				}
+			}
+			ha_mat_free(local_T);
+		}
+		free(weights);
+		return error;
+	}
+
+	// Metal path: fall back to CPU32 if Metal not available
+	THaBackend actual = backend;
+	if (actual == kHaBackendMetal && !ha_metal_available())
+		actual = kHaBackendCPU32;
+
+	// ---- CPU FP32 path ----
+	if (actual == kHaBackendCPU32) {
+		int error = kHaSuccess;
+		#ifdef _OPENMP
+		#pragma omp parallel for schedule(dynamic, 1)
+		#endif
+		for (int32_t s = 0; s < count; s++) {
+			if (error != kHaSuccess) continue;
+			int32_t off = sl_offsets[s];
+			int32_t sz = sl_offsets[s + 1] - off;
+			const int32_t *sl = &sl_indices[off];
+
+			TMat *local_X = ha_mat_alloc(nt, sz);
+			TMat *local_Y = ha_mat_alloc(nt, sz);
+			if (!local_X || !local_Y) {
+				ha_mat_free(local_X); ha_mat_free(local_Y);
+				error = kHaErrorAlloc;
+				continue;
+			}
+			ha_mat_extract_cols(&X_mat, sl, sz, local_X);
+			ha_mat_extract_cols(&Y_mat, sl, sz, local_Y);
+
+			TMatF *fX = ha_mat_to_float(local_X);
+			TMatF *fY = ha_mat_to_float(local_Y);
+			TMatF *fT = ha_matf_alloc(sz, sz);
+			ha_mat_free(local_X);
+			ha_mat_free(local_Y);
+			if (!fX || !fY || !fT) {
+				ha_matf_free(fX); ha_matf_free(fY); ha_matf_free(fT);
+				error = kHaErrorAlloc;
+				continue;
+			}
+
+			int rc = ha_procrustes_f32(fX, fY, fT, isReflection, isScaling);
+			if (rc != kHaSuccess) {
+				ha_matf_free(fX); ha_matf_free(fY); ha_matf_free(fT);
+				error = rc;
+				continue;
+			}
+
+			const double *w = &weights[off];
+			for (int32_t i = 0; i < sz; i++) {
+				int32_t row = sl[i];
+				double wi = w[i];
+				for (int32_t j = 0; j < sz; j++) {
+					double val = (double)fT->data[i * sz + j] * wi;
+					#ifdef _OPENMP
+					#pragma omp atomic
+					#endif
+					T_out[row * nv + sl[j]] += val;
+				}
+			}
+			ha_matf_free(fX); ha_matf_free(fY); ha_matf_free(fT);
+		}
+		free(weights);
+		return error;
+	}
+
+	// ---- Metal batched + pipelined path ----
+	#define METAL_BATCH_DENSE 256
+
+	int32_t max_batch = METAL_BATCH_DENSE < count ? METAL_BATCH_DENSE : count;
+	float **b_Xdata = (float **)malloc((size_t)max_batch * sizeof(float *));
+	float **b_Ydata = (float **)malloc((size_t)max_batch * sizeof(float *));
+	float **b_Adata = (float **)malloc((size_t)max_batch * sizeof(float *));
+	int32_t *b_sizes = (int32_t *)malloc((size_t)max_batch * sizeof(int32_t));
+	if (!b_Xdata || !b_Ydata || !b_Adata || !b_sizes) {
+		free(b_Xdata); free(b_Ydata); free(b_Adata); free(b_sizes);
+		free(weights);
+		return kHaErrorAlloc;
+	}
+
+	int result = kHaSuccess;
+	HaMetalBatch *pending = NULL;
+	int32_t pending_start = 0, pending_count = 0;
+	float **p_Xdata = NULL, **p_Ydata = NULL, **p_Adata = NULL;
+	int32_t *p_sizes = NULL;
+
+	for (int32_t batch_start = 0; batch_start < count; batch_start += METAL_BATCH_DENSE) {
+		int32_t batch_end = batch_start + METAL_BATCH_DENSE;
+		if (batch_end > count) batch_end = count;
+		int32_t batch_count = batch_end - batch_start;
+
+		for (int32_t i = 0; i < batch_count; i++) {
+			int32_t s = batch_start + i;
+			int32_t off = sl_offsets[s];
+			int32_t sz = sl_offsets[s + 1] - off;
+			const int32_t *sl = &sl_indices[off];
+			b_sizes[i] = sz;
+
+			TMat *lX = ha_mat_alloc(nt, sz);
+			TMat *lY = ha_mat_alloc(nt, sz);
+			if (!lX || !lY) { ha_mat_free(lX); ha_mat_free(lY); result = kHaErrorAlloc; break; }
+			ha_mat_extract_cols(&X_mat, sl, sz, lX);
+			ha_mat_extract_cols(&Y_mat, sl, sz, lY);
+
+			TMatF *fX = ha_mat_to_float(lX);
+			TMatF *fY = ha_mat_to_float(lY);
+			ha_mat_free(lX);
+			ha_mat_free(lY);
+			if (!fX || !fY) { ha_matf_free(fX); ha_matf_free(fY); result = kHaErrorAlloc; break; }
+
+			b_Xdata[i] = fX->data; free(fX);
+			b_Ydata[i] = fY->data; free(fY);
+			b_Adata[i] = (float *)malloc((size_t)sz * sz * sizeof(float));
+			if (!b_Adata[i]) { result = kHaErrorAlloc; break; }
+		}
+		if (result != kHaSuccess) break;
+
+		HaMetalBatch *current = ha_metal_batch_submit(batch_count, nt, b_sizes,
+		                                               b_Xdata, b_Ydata);
+		if (!current) { result = kHaErrorInternal; break; }
+
+		if (pending) {
+			int rc = ha_metal_batch_wait(pending, p_Adata);
+			ha_metal_batch_free(pending);
+			pending = NULL;
+			if (rc != kHaSuccess) { result = rc; break; }
+
+			rc = metal_process_batch_dense(pending_start, pending_count, p_sizes,
+			                               p_Xdata, p_Ydata, p_Adata,
+			                               sl_indices, sl_offsets, weights,
+			                               T_out, nv,
+			                               isReflection, isScaling, nt);
+			if (rc != kHaSuccess) result = rc;
+
+			for (int32_t i = 0; i < pending_count; i++) {
+				free(p_Xdata[i]); free(p_Ydata[i]); free(p_Adata[i]);
+			}
+			free(p_Xdata); free(p_Ydata); free(p_Adata); free(p_sizes);
+			p_Xdata = p_Ydata = p_Adata = NULL; p_sizes = NULL;
+		}
+		if (result != kHaSuccess) {
+			ha_metal_batch_free(current);
+			break;
+		}
+
+		pending = current;
+		pending_start = batch_start;
+		pending_count = batch_count;
+		p_Xdata = (float **)malloc((size_t)batch_count * sizeof(float *));
+		p_Ydata = (float **)malloc((size_t)batch_count * sizeof(float *));
+		p_Adata = (float **)malloc((size_t)batch_count * sizeof(float *));
+		p_sizes = (int32_t *)malloc((size_t)batch_count * sizeof(int32_t));
+		if (!p_Xdata || !p_Ydata || !p_Adata || !p_sizes) {
+			result = kHaErrorAlloc;
+			ha_metal_batch_free(pending); pending = NULL;
+			break;
+		}
+		memcpy(p_Xdata, b_Xdata, (size_t)batch_count * sizeof(float *));
+		memcpy(p_Ydata, b_Ydata, (size_t)batch_count * sizeof(float *));
+		memcpy(p_Adata, b_Adata, (size_t)batch_count * sizeof(float *));
+		memcpy(p_sizes, b_sizes, (size_t)batch_count * sizeof(int32_t));
+	}
+
+	// Process final pending batch
+	if (pending && result == kHaSuccess) {
+		int rc = ha_metal_batch_wait(pending, p_Adata);
+		ha_metal_batch_free(pending);
+		pending = NULL;
+		if (rc != kHaSuccess) { result = rc; goto dense_cleanup; }
+
+		rc = metal_process_batch_dense(pending_start, pending_count, p_sizes,
+		                               p_Xdata, p_Ydata, p_Adata,
+		                               sl_indices, sl_offsets, weights,
+		                               T_out, nv,
+		                               isReflection, isScaling, nt);
+		if (rc != kHaSuccess) result = rc;
+	}
+
+dense_cleanup:
+	if (pending) ha_metal_batch_free(pending);
+	if (p_Xdata) {
+		for (int32_t i = 0; i < pending_count; i++) {
+			free(p_Xdata[i]); free(p_Ydata[i]); free(p_Adata[i]);
+		}
+		free(p_Xdata); free(p_Ydata); free(p_Adata); free(p_sizes);
+	}
+	free(b_Xdata); free(b_Ydata); free(b_Adata); free(b_sizes);
+	free(weights);
+	return result;
+	#undef METAL_BATCH_DENSE
+}
+
 int ha_searchlight_ridge(const TMat *X, const TMat *Y,
                          const TSearchlights *sls_X,
                          const TSearchlights *sls_Y,

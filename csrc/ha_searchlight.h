@@ -52,6 +52,31 @@ int ha_searchlight_procrustes(const TMat *X, const TMat *Y,
                               THaBackend backend);
 
 /*
+ * Searchlight Procrustes with flat-array input and dense output.
+ * Weights are computed internally. No sparse structure is allocated.
+ *
+ * Input layout (flat concatenated arrays):
+ *   sl_indices[sl_offsets[s] .. sl_offsets[s+1])  = vertex indices for searchlight s
+ *   sl_dists[sl_offsets[s] .. sl_offsets[s+1])    = distances for searchlight s
+ *   sl_offsets has (count + 1) elements; sl_offsets[0] = 0.
+ *
+ * X_data, Y_data: row-major nt x nv (not modified).
+ * T_out: pre-allocated nv x nv dense matrix, must be zero-initialized by caller.
+ * sl_dists: NULL for uniform weighting.
+ */
+int ha_searchlight_procrustes_dense(
+    const double *X_data, const double *Y_data,
+    int32_t nt, int32_t nv,
+    const int32_t *sl_indices,
+    const int32_t *sl_offsets,
+    const double *sl_dists,
+    int32_t count,
+    double radius,
+    double *T_out,
+    bool isReflection, bool isScaling,
+    THaBackend backend);
+
+/*
  * Searchlight ridge alignment.
  * Same pattern as searchlight Procrustes but uses ridge regression.
  */

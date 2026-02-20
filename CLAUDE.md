@@ -341,35 +341,36 @@ We tried pre-allocating thread-local work buffers (`TProcWorkspace` structs hold
 
 | Backend | Threads | Total (s) | vs Python |
 |---------|---------|-----------|-----------|
-| Python (numpy/Accelerate) | auto | 30.9 | 1.0x |
-| C CPU FP64 | 1 | 77.4 | 0.4x |
-| C CPU FP64 | 10 | 31.0 | 1.0x |
-| C CPU FP32 | 1 | 69.9 | 0.4x |
-| **C CPU FP32** | **10** | **28.8** | **1.1x** |
-| C Metal GPU | 1 | 89.8 | 0.3x |
-| C Metal GPU | 10 | 61.7 | 0.5x |
+| Python (numpy/Accelerate) | auto | 32.1 | 1.0x |
+| C CPU FP64 | 1 | 56.3 | 0.6x |
+| **C CPU FP64** | **10** | **8.7** | **3.7x** |
+| C CPU FP32 | 1 | 49.0 | 0.7x |
+| **C CPU FP32** | **10** | **7.2** | **4.4x** |
+| C Metal GPU | 10 | 41.8 | 0.8x |
+
+### Dense output was a major win
+
+Switching from sparse CSC output (ha_sparse_init + binary-search scatter-add + omp critical) to dense output (direct indexed scatter-add + omp atomic) gave a 3-4x speedup for multi-threaded runs. The sparse infrastructure — not SVD — was the dominant bottleneck at high thread counts. The `ha_sparse_init` qsort of Σ(sz²) pairs and the global `#pragma omp critical` lock were the main culprits. The Python reference implementation already used dense output — we just matched its approach in C.
 
 ### Remaining optimization ceiling
 
-C FP32 10-thread (28.8s) already beats Python (30.9s) by 7%. Further gains are marginal:
+At 7.2s (C FP32 10-thread), the breakdown is roughly: ~5s SVD, ~1s column extraction + float conversion, ~1s scatter-add + thread overhead. SVD is the hard floor. Marginal gains possible:
 
-- **`#pragma omp critical` contention**: all scatter-adds serialize through one global lock. Fine-grained per-column locks or precomputed sparse offsets could help, but SVD is ~95% of runtime so <2% expected gain.
-- **`dgesvd` vs `dgesdd`**: divide-and-conquer (`dgesdd`) has setup overhead that may not pay off for N~200. QR-iteration (`dgesvd`) might be marginally faster for small matrices.
-- **CPU polar Newton (skip SVD)**: `ha_polar_newton` exists for Metal path. FP64 variant would need ~4-6 LU iterations, likely comparable to 1 SVD — no clear win.
-- **Linux may benefit from workspace pre-allocation**: glibc malloc is less efficient than macOS magazine allocator for this pattern.
-- **More threads**: M4 Pro has 14 cores (10P+4E). Using 14 instead of 10 might squeeze 10-15% more, but efficiency cores are slower.
+- **Skip double↔float round-trip in CPU32**: direct float extraction from double matrix. ~0.3-0.5s.
+- **14 threads instead of 10**: E-cores are slower but could help. ~10-15%.
+- **Metal**: bottlenecked by CPU Newton iteration (no GPU SVD in MPS). Would need custom Metal compute shaders for small-matrix SVD — big project, uncertain payoff.
 
-The 2.5x single-threaded gap vs Python is a numpy/Accelerate integration advantage (internal workspace caching, cache-optimized call patterns) that cannot be closed from external C code.
+The single-threaded gap (C 49s vs Python 32s) is Accelerate-internal optimization we can't close, but it's irrelevant since multi-threaded C is 4.4x faster.
 
 ## Python ctypes Wrapper (`hyperalignment_c.py`)
 
 Loads `csrc/libhyperalignment.dylib` (or `.so`) via ctypes. Main function:
 ```python
 searchlight_procrustes(X, Y, sls, dists, radius, backend='cpu64', reflection=True, scaling=False)
-# Returns scipy.sparse.csc_matrix
+# Returns dense numpy ndarray (nv x nv)
 ```
 
-**Memory management**: Input matrices are zero-copy (numpy `.ctypes.data` passed to TMat). C-allocated memory (sparse matrix, weights) is freed via libc `free()` obtained from `ctypes.CDLL(None)` — the `ha_sparse_free`/`ha_mat_free` helpers are `static inline` in `ha_common.h` and not exported from the shared library.
+Uses `ha_searchlight_procrustes_dense` — a single C call that takes flat numpy arrays (concatenated searchlight indices + offsets) and writes into a caller-provided dense output matrix. Weights are computed internally. No sparse structure, no pointer-of-pointers, no per-searchlight memory management.
 
 **Installed vs source API difference**: The installed `hyperalignment` package has `searchlight_procrustes(X, Y, sls, dists, radius, ...)` while the source in `src/` has a different signature `(X, Y, sls, sls_Y=None, mat0=None, ...)`. The benchmark uses the installed API.
 
