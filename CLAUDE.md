@@ -145,22 +145,29 @@ csrc/
 ### Build commands
 ```bash
 cd csrc
-make                  # Release build -> libhyperalignment.a + .dylib/.so
-make test             # Build and run tests
-make DEBUG=1 test     # Build with AddressSanitizer and run tests
-make OPENMP=1         # Build with OpenMP searchlight parallelism
-make OPENMP=1 test    # Build with OpenMP and run tests
+make                       # Release build -> libhyperalignment.a + .dylib/.so
+make test                  # Build and run tests
+make DEBUG=1 test          # Build with AddressSanitizer and run tests
+make OPENMP=1              # Build with OpenMP searchlight parallelism
+make OPENMP=1 test         # Build with OpenMP and run tests
+make CUDA=1 OPENMP=1       # Build with CUDA + OpenMP (Linux, requires NVIDIA GPU)
+make CUDA=1 OPENMP=1 test  # Build with CUDA + OpenMP and run tests
 make clean
 ```
+
+**Linux prerequisites**: Anaconda with `mkl-devel` (`conda install mkl-devel`). CUDA libraries at `/usr/lib/x86_64-linux-gnu` (standard Ubuntu CUDA package). OpenMP via `gcc -fopenmp` (no extra package needed). Set `MKL_NUM_THREADS=1` at runtime to prevent MKL from spawning internal BLAS threads that conflict with OpenMP.
+
+**macOS prerequisites**: Xcode Command Line Tools, Homebrew `libomp`. Metal backend requires macOS and Apple Silicon.
 
 ### Compiler flags
 - `-std=c11 -O2 -Wall -Wextra -Wpedantic -fPIC` for release
 - `-std=c11 -g -O0 -fsanitize=address` for debug
 - `-framework Accelerate -framework Metal -framework MetalPerformanceShaders -framework Foundation` on macOS
-- `-llapack -lblas -lm` on Linux
+- `-lmkl_rt -lm -L$(HOME)/anaconda3/lib` on Linux (Anaconda MKL)
 - OpenMP opt-in via `OPENMP=1` flag
   - macOS: `-Xpreprocessor -fopenmp` + homebrew libomp
   - Linux: `-fopenmp`
+- CUDA opt-in via `CUDA=1` (Linux only): links `-lcudart -lcublas -lcusolver` from `/usr/lib/x86_64-linux-gnu`
 
 ## LAPACK/BLAS Functions Used
 
@@ -270,6 +277,48 @@ Python "Threads" column: 1 = default, 10 = `VECLIB_MAXIMUM_THREADS=10`. No measu
 | C CPU FP32 | 18.5s | 2.5s | 7.4x |
 
 Sub-linear scaling (6.7-7.4x on 10 cores) due to memory bandwidth contention and Accelerate-internal threading within individual LAPACK calls.
+
+### Benchmark Results (AMD Threadripper 7995WX + RTX 4090, Forrest Dataset, Median of 3)
+
+Hardware: AMD Threadripper 7995WX (96 cores / 192 threads), NVIDIA RTX 4090 (24 GB GDDR6X), Ubuntu 24.04. MKL_NUM_THREADS=1 to suppress BLAS internal threading.
+
+| Backend | Threads | L hemi (s) | R hemi (s) | Total (s) | vs Python |
+|---------|---------|-----------|-----------|-----------|-----------|
+| Python (numpy/MKL) | 1 | 59.8 | 59.5 | 119.5 | 1.0x |
+| C CPU FP64 | 1 | 25.6 | 25.6 | 51.2 | 2.3x |
+| C CPU FP32 | 1 | 17.2 | 17.1 | 34.3 | 3.5x |
+| C CPU FP64 | 32 | 1.6 | 1.7 | 3.3 | 36x |
+| C CPU FP32 | 32 | 1.1 | 1.1 | 2.3 | 52x |
+| **C CPU FP64** | **96** | **1.09** | **1.05** | **2.1** | **57x** |
+| **C CPU FP32** | **96** | **0.64** | **0.59** | **1.2** | **100x** |
+| C CUDA GPU FP32 | — | 21.1 | 21.1 | 42.3 | 2.8x |
+
+All backends produce numerically identical percentile distributions. Python is 4x slower on Threadripper than M4 Pro (single-threaded MKL vs Accelerate with AMX).
+
+### OpenMP Scaling (Threadripper 7995WX, 96 physical cores)
+
+| Backend | 1 thread | 32 threads | 96 threads | 32→96 ratio |
+|---------|----------|------------|------------|------------|
+| C CPU FP64 | 51.2s | 3.3s | 2.1s | 0.64x |
+| C CPU FP32 | 34.3s | 2.3s | 1.2s | 0.52x |
+
+Scaling from 32→96 threads is ~0.5-0.6x (not linear) due to NUMA topology. The Threadripper 7995WX has 4 NUMA nodes; threads on remote nodes pay higher memory latency. Setting `OMP_PROC_BIND=close` may improve this. C CPU FP32 at 96 threads achieves **100x speedup** vs Python and **1.2s total** for both hemispheres.
+
+### CUDA Backend Analysis
+
+The RTX 4090 CUDA backend (**42.3s**) is significantly slower than CPU multi-threading (**1.2s at 96 threads FP32**). This is expected and has a known explanation:
+
+**Root cause**: `cusolverDnSgesvdaStridedBatched` — our only option for batched SVD of 121×121 matrices — computes an approximate SVD using iterative polar decomposition (Jacobi sweeps). For matrices this small, the iterative algorithm requires many sweeps to converge, and the 256-batch GPU execution doesn't provide enough parallelism to amortize the overhead. The effective GPU utilization during SVD is low.
+
+**Why not use other cuSOLVER routines**:
+- `cusolverDnSgesvdjBatched`: hard limit of 32×32 — not usable at 121×121
+- `cusolverDnSgesvdj` (non-batched): no size limit but effectively serializes 9,675 SVDs
+- `cusolverDnSgesvd` (QR-based): synchronous, no batching
+
+**What would help** (future work):
+- Custom one-sided Jacobi SVD kernel: true parallel batched SVD at any size, GPU thread per matrix element
+- Hybrid: GPU GEMM for `A = X^T @ Y`, download A, CPU SVD (MKL 96 threads), upload U/V, GPU GEMM for `T = U @ V^T`. The CPU SVD bottleneck is ~18s FP32 single-threaded / ~0.2s at 96 threads — fast enough to be negligible.
+- For `gesvdaStridedBatched`: the "approximate" in the name means it uses `rank=k` truncated SVD. We need `k=max_sz` (full rank) which is most expensive.
 
 ### Key Optimizations (in order of impact)
 

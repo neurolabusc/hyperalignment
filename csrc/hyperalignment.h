@@ -14,5 +14,6 @@
 #include "ha_template.h"
 #include "ha_ensemble.h"
 #include "ha_metal.h"
+#include "ha_cuda.h"
 
 #endif // HYPERALIGNMENT_H

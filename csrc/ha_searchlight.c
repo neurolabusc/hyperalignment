@@ -11,6 +11,7 @@
 #include "ha_ridge.h"
 #include "ha_sparse.h"
 #include "ha_metal.h"
+#include "ha_cuda.h"
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -287,6 +288,11 @@ int ha_searchlight_procrustes(const TMat *X, const TMat *Y,
 		if (batch_end > total) batch_end = total;
 		int32_t batch_count = batch_end - batch_start;
 
+		// Zero batch pointer arrays so partial-fill entries are NULL and free(NULL) is safe
+		memset(b_Xdata, 0, (size_t)batch_count * sizeof(float *));
+		memset(b_Ydata, 0, (size_t)batch_count * sizeof(float *));
+		memset(b_Adata, 0, (size_t)batch_count * sizeof(float *));
+
 		// Extract submatrices and convert to float
 		for (int32_t i = 0; i < batch_count; i++) {
 			int32_t s = batch_start + i;
@@ -311,12 +317,24 @@ int ha_searchlight_procrustes(const TMat *X, const TMat *Y,
 			b_Adata[i] = (float *)malloc((size_t)sz * sz * sizeof(float));
 			if (!b_Adata[i]) { result = kHaErrorAlloc; break; }
 		}
-		if (result != kHaSuccess) break;
+		if (result != kHaSuccess) {
+			// Free all entries built before the break (NULL entries are no-ops)
+			for (int32_t j = 0; j < batch_count; j++) {
+				free(b_Xdata[j]); free(b_Ydata[j]); free(b_Adata[j]);
+			}
+			break;
+		}
 
 		// Submit this batch's GEMM to GPU (non-blocking)
 		HaMetalBatch *current = ha_metal_batch_submit(batch_count, nt, b_sizes,
 		                                               b_Xdata, b_Ydata);
-		if (!current) { result = kHaErrorInternal; break; }
+		if (!current) {
+			for (int32_t j = 0; j < batch_count; j++) {
+				free(b_Xdata[j]); free(b_Ydata[j]); free(b_Adata[j]);
+			}
+			result = kHaErrorInternal;
+			break;
+		}
 
 		// Process PREVIOUS batch (Newton + scatter) while GPU works on current
 		if (pending) {
@@ -351,6 +369,12 @@ int ha_searchlight_procrustes(const TMat *X, const TMat *Y,
 		p_Adata = (float **)malloc((size_t)batch_count * sizeof(float *));
 		p_sizes = (int32_t *)malloc((size_t)batch_count * sizeof(int32_t));
 		if (!p_Xdata || !p_Ydata || !p_Adata || !p_sizes) {
+			// Free partial pointer-array allocations and batch data we can no longer track
+			free(p_Xdata); free(p_Ydata); free(p_Adata); free(p_sizes);
+			p_Xdata = p_Ydata = p_Adata = NULL; p_sizes = NULL;
+			for (int32_t j = 0; j < batch_count; j++) {
+				free(b_Xdata[j]); free(b_Ydata[j]); free(b_Adata[j]);
+			}
 			result = kHaErrorAlloc;
 			ha_metal_batch_free(pending); pending = NULL;
 			break;
@@ -1081,10 +1105,32 @@ int ha_searchlight_procrustes_dense(
 		return error;
 	}
 
-	// Metal path: fall back to CPU32 if Metal not available
+	// Resolve effective backend (apply fallbacks before dispatching)
 	THaBackend actual = backend;
+	if (actual == kHaBackendCUDA) {
+		if (!ha_cuda_available() || !col_major || !isReflection) {
+			if (!ha_cuda_available())
+				fprintf(stderr, "ha_searchlight: CUDA not available; falling back to CPU FP32\n");
+			else
+				fprintf(stderr, "ha_searchlight: CUDA requires col_major=true and "
+				        "isReflection=true; falling back to CPU FP32\n");
+			actual = kHaBackendCPU32;
+		}
+	}
 	if (actual == kHaBackendMetal && !ha_metal_available())
 		actual = kHaBackendCPU32;
+
+	// ---- CUDA path ----
+	if (actual == kHaBackendCUDA) {
+		int rc = ha_searchlight_procrustes_cuda(
+		    X_data, Y_data, nt, nv,
+		    sl_indices, sl_offsets, sl_dists,
+		    count, radius, T_out,
+		    isReflection, isScaling, col_major);
+		// ha_cuda recomputes weights internally; free the copy made above.
+		free(weights);
+		return rc;
+	}
 
 	// ---- CPU FP32 path ----
 	if (actual == kHaBackendCPU32) {

@@ -24,9 +24,12 @@
 	#include <Accelerate/Accelerate.h>
 	typedef __LAPACK_int ha_lapack_int;
 #else
-	#include <cblas.h>
-	#include <lapack.h>
-	typedef int ha_lapack_int;
+	// MKL on Linux (Anaconda): single runtime library, proper C headers.
+	// mkl_cblas.h provides the CBLAS interface.
+	// mkl_lapack.h declares the Fortran LAPACK symbols (dgesdd_ etc.).
+	#include <mkl_cblas.h>
+	#include <mkl_lapack.h>
+	typedef MKL_INT ha_lapack_int;
 #endif
 
 // Error codes
@@ -68,7 +71,8 @@ typedef struct {
 typedef enum {
 	kHaBackendCPU64 = 0,   // CPU double precision (default)
 	kHaBackendCPU32 = 1,   // CPU single precision
-	kHaBackendMetal = 2,   // Metal GPU (FP32)
+	kHaBackendMetal = 2,   // Metal GPU FP32 (macOS only)
+	kHaBackendCUDA  = 3,   // CUDA GPU FP32 (Linux/Windows with NVIDIA GPU)
 } THaBackend;
 
 // Element access macros

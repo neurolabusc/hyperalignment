@@ -59,15 +59,29 @@ _lib.ha_searchlight_procrustes_dense.argtypes = [
     ctypes.c_bool,                     # col_major
 ]
 
-# Metal init/cleanup
-_lib.ha_metal_init.restype = ctypes.c_int
-_lib.ha_metal_init.argtypes = []
+# Metal init/cleanup (macOS only — symbols are static inline stubs on Linux)
+_HAS_METAL = sys.platform == "darwin"
+if _HAS_METAL:
+    _lib.ha_metal_init.restype = ctypes.c_int
+    _lib.ha_metal_init.argtypes = []
+    _lib.ha_metal_cleanup.restype = None
+    _lib.ha_metal_cleanup.argtypes = []
+    _lib.ha_metal_available.restype = ctypes.c_bool
+    _lib.ha_metal_available.argtypes = []
 
-_lib.ha_metal_cleanup.restype = None
-_lib.ha_metal_cleanup.argtypes = []
-
-_lib.ha_metal_available.restype = ctypes.c_bool
-_lib.ha_metal_available.argtypes = []
+# CUDA init/cleanup — only present when compiled with CUDA=1.
+# Static inline stubs are NOT exported; probe with try/except.
+_HAS_CUDA = False
+try:
+    _lib.ha_cuda_init.restype = ctypes.c_int
+    _lib.ha_cuda_init.argtypes = []
+    _lib.ha_cuda_cleanup.restype = None
+    _lib.ha_cuda_cleanup.argtypes = []
+    _lib.ha_cuda_available.restype = ctypes.c_bool
+    _lib.ha_cuda_available.argtypes = []
+    _HAS_CUDA = True
+except AttributeError:
+    pass
 
 # Thread control
 _lib.ha_set_num_threads.restype = None
@@ -87,6 +101,7 @@ _BACKENDS = {
     "cpu32": 1,
     "c32": 1,
     "metal": 2,
+    "cuda": 3,
 }
 
 
@@ -158,12 +173,26 @@ def searchlight_procrustes(X, Y, sls, dists, radius, backend="cpu64",
     # Allocate dense output (zero-initialized by numpy)
     T = np.zeros((nv, nv), dtype=np.float64)
 
-    # Metal init if needed
-    metal_inited = False
+    # GPU init if needed (Metal or CUDA)
+    gpu_inited = False
     if backend_enum == 2:  # kHaBackendMetal
+        if not _HAS_METAL:
+            raise RuntimeError("Metal backend is only available on macOS.")
         rc = _lib.ha_metal_init()
         if rc == 0:
-            metal_inited = True
+            gpu_inited = True
+    elif backend_enum == 3:  # kHaBackendCUDA
+        if not _HAS_CUDA:
+            raise RuntimeError(
+                "CUDA backend not compiled in. Rebuild with 'make CUDA=1'."
+            )
+        rc = _lib.ha_cuda_init()
+        if rc != 0:
+            raise RuntimeError(
+                "ha_cuda_init() failed. Is the library built with CUDA=1 "
+                "and an NVIDIA GPU present?"
+            )
+        gpu_inited = True
 
     # Single C call
     rc = _lib.ha_searchlight_procrustes_dense(
@@ -183,8 +212,10 @@ def searchlight_procrustes(X, Y, sls, dists, radius, backend="cpu64",
         ctypes.c_bool(True),  # col_major=True (data is Fortran-order)
     )
 
-    if metal_inited:
+    if backend_enum == 2 and gpu_inited and _HAS_METAL:
         _lib.ha_metal_cleanup()
+    elif backend_enum == 3 and gpu_inited and _HAS_CUDA:
+        _lib.ha_cuda_cleanup()
 
     if rc != 0:
         raise RuntimeError(f"ha_searchlight_procrustes_dense failed with error code {rc}")

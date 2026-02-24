@@ -64,226 +64,223 @@ Typical dimensions: n_samples ~ 200-500 timepoints, n_voxels ~ 10,000-40,000 cor
 
 ## C Library
 
-A complete C implementation lives in `csrc/` with three compute backends:
+A complete C implementation lives in `csrc/` with four compute backends:
 
 | Backend | Precision | Platform | Description |
 |---------|-----------|----------|-------------|
-| **CPU FP64** | double | All | Default. Uses LAPACK/BLAS (Accelerate on macOS, OpenBLAS on Linux) |
-| **CPU FP32** | float | All | Single-precision variant for comparison |
+| **CPU FP64** | double | All | Default. LAPACK/BLAS (Accelerate on macOS, MKL on Linux) |
+| **CPU FP32** | float | All | Single-precision variant. Faster SVD, same output accuracy |
 | **Metal GPU** | float | macOS | Apple Metal Performance Shaders via polar decomposition |
+| **CUDA GPU** | float | Linux/NVIDIA | cuBLAS batched GEMM + cuSOLVER batched SVD |
 
 Backend selection is at runtime via the `THaBackend` enum — no recompilation needed.
 
 ### Building
 
-Requires a C11 compiler and a LAPACK/BLAS provider. On macOS the Apple Accelerate framework is used automatically; on Linux, install `liblapack-dev` and `libopenblas-dev` (or equivalent).
-
+**macOS** — Apple Accelerate is used automatically:
 ```bash
 cd csrc
-make                # builds libhyperalignment.a (static) and .dylib/.so (shared)
-make DEBUG=1        # debug build with AddressSanitizer
-make OPENMP=1       # enable OpenMP for searchlight parallelism
-make test           # build and run all tests
-make clean          # remove build artifacts
+make OPENMP=1           # CPU backends with OpenMP
+make OPENMP=1 test      # build and run tests
 ```
 
-On macOS, the Metal frameworks are linked automatically. On Linux, only the CPU backends are available; the Metal header provides inline stubs that return error codes.
+**Linux (Anaconda)** — uses Intel MKL from the Anaconda environment:
+```bash
+# One-time: install MKL development headers
+conda install mkl-devel
+
+cd csrc
+make OPENMP=1           # CPU backends with OpenMP
+make OPENMP=1 test      # build and run tests
+make CUDA=1 OPENMP=1    # also build CUDA backend (requires NVIDIA GPU + CUDA toolkit)
+```
+
+Other build targets:
+```bash
+make                    # builds libhyperalignment.a + .dylib/.so
+make DEBUG=1 test       # AddressSanitizer build
+make clean
+```
+
+Set `MKL_NUM_THREADS=1` (or `OPENBLAS_NUM_THREADS=1`) at runtime to suppress BLAS internal threading, which conflicts with the OpenMP outer loop.
 
 ### Running Tests
 
-The test suite (`ha_test.c`) contains 2621 deterministic tests covering all modules and all three backends.
+On macOS (all 4 backends including Metal): **2621 tests**. On Linux (no Metal): **2216 tests**. The difference is Metal-specific tests that are excluded on non-Apple platforms.
 
 ```bash
 cd csrc
-make test           # build and run tests (optimized)
-make DEBUG=1 test   # build and run tests with AddressSanitizer
+make OPENMP=1 test           # CPU tests
+make CUDA=1 OPENMP=1 test    # CPU + CUDA tests (Linux)
 ```
 
 Expected output:
-
 ```
 Running hyperalignment C tests...
-
-test_svd_reconstruction
-test_svd_wide_matrix
-test_svd_mean_removal
-test_pca
-test_procrustes_identity
-test_procrustes_known_rotation
-test_procrustes_no_reflection
-test_ridge_small_alpha
-test_sparse_init
-test_sparse_scatter_add
-test_searchlight_weights_uniform
-test_zscore
-test_template_identical_subjects
-test_ensemble_indices
-test_svd_f32_reconstruction
-test_procrustes_f32_identity
-test_procrustes_f32_known_rotation
-test_procrustes_metal_identity
-test_procrustes_metal_known_rotation
-test_metal_cleanup
-
-2621 tests: 2621 passed, 0 failed
+...
+2216 tests: 2216 passed, 0 failed   # Linux
+2621 tests: 2621 passed, 0 failed   # macOS
 ```
 
 ### C Source Layout
 
 ```
 csrc/
-    Makefile              Platform-detecting build system (static + shared library)
-    ha_common.h           Types (TMat, TMatF, TSparseCSC, TSearchlights, THaBackend), alloc helpers
-    ha_linalg.h/.c        SVD FP64 (dgesdd/dgesvd), SVD FP32 (sgesdd/sgesvd), PCA, z-score
+    Makefile              Platform-detecting build (macOS Accelerate, Linux MKL, CUDA opt-in)
+    ha_common.h           Types, LAPACK/BLAS includes (platform-conditional), THaBackend enum
+    ha_linalg.h/.c        SVD FP64/FP32, PCA, z-score
     ha_procrustes.h/.c    Procrustes FP64 + FP32
     ha_ridge.h/.c         Ridge regression, grid search, ensemble ridge
     ha_sparse.h/.c        CSC sparse matrix init, scatter-add
     ha_searchlight.h/.c   Searchlight weights, alignment loops with backend dispatch
     ha_template.h/.c      Template construction (Procrustes, GPA, PCA)
     ha_ensemble.h/.c      Cross-validation index generation
-    ha_metal.h            Metal API header (stubs on non-Apple)
+    ha_metal.h            Metal API header (inline stubs on non-Apple)
     ha_metal.m            Metal/MPS implementation (macOS only, Objective-C)
+    ha_cuda.h             CUDA API header (inline stubs when CUDA=1 not set)
+    ha_cuda.cu            CUDA implementation (gather, batched SVD, scatter-add)
     hyperalignment.h      Umbrella header
-    ha_test.c             Test harness (2621 tests)
+    ha_test.c             Test harness
 ```
 
-### Metal GPU Backend
+### GPU Backends
 
-The Metal backend computes Procrustes alignment without SVD by using **polar decomposition via Newton iteration**:
-
+**Metal (macOS)** — polar decomposition via Newton iteration:
 ```
 X_0 = X^T @ Y                          (GPU GEMM via MPSMatrixMultiplication)
 X_{k+1} = (X_k + X_k^{-T}) / 2        (CPU LAPACK inverse + transpose, ~6-10 iterations)
 T = X_converged                          (orthogonal polar factor)
 ```
+Metal Performance Shaders does not provide SVD, so an iterative Newton approach is used. Falls back to CPU FP32 if singular.
 
-This avoids the SVD entirely — Metal Performance Shaders provides GEMM, LU decomposition, and triangular solve, but not SVD. The Newton iteration converges cubically and typically needs 6-10 iterations for FP32 precision. Falls back to CPU FP32 SVD if the matrix is singular.
+**CUDA (Linux/NVIDIA)** — batched GEMM + batched approximate SVD:
+```
+A_i = local_X_i^T @ local_Y_i          (cublasSgemmStridedBatched)
+A_i = U_i * S_i * V_i^T                (cusolverDnSgesvdaStridedBatched)
+T_i = U_i @ V_i^T                       (cublasSgemmStridedBatched)
+T_out[sl_r, sl_c] += T_i[r,c] * w[r]   (custom kernel, FP64 atomicAdd)
+```
+Processes 256 searchlights per batch. All matrices are zero-padded to the maximum searchlight size for uniform batch dimensions. Subject data (FP64) is converted to FP32 on-GPU; scatter-add uses FP64 for numerical accuracy.
 
 ### Python ctypes Wrapper
 
-`hyperalignment_c.py` provides a Python interface to the C library via ctypes. It loads the shared library (`libhyperalignment.dylib` or `.so`) and exposes a `searchlight_procrustes()` function compatible with the benchmark script.
+`hyperalignment_c.py` provides a Python interface to the C library:
 
 ```python
 import hyperalignment_c as hac
 
 W = hac.searchlight_procrustes(
     X, Y, sls, dists, radius,
-    backend='cpu64',  # or 'cpu32', 'metal'
-    n_jobs=10,        # OpenMP threads (requires OPENMP=1 build)
+    backend='cpu64',  # 'cpu64', 'cpu32', 'metal' (macOS), 'cuda' (Linux/NVIDIA)
+    n_jobs=96,        # OpenMP threads (requires OPENMP=1 build)
 )
-# W is a dense (nv, nv) numpy array
+# W is a dense (nv, nv) numpy float64 array
 ```
 
-The wrapper converts input matrices to Fortran (column-major) order for cache-efficient column extraction in C, builds flat searchlight index arrays via vectorized numpy ops, and passes everything to C in a single call. The dense output matrix is allocated in Python and written directly by C (zero-copy).
+Input matrices are converted to Fortran (column-major) order for cache-efficient column extraction in C. Searchlight index arrays are built with vectorized numpy ops. The dense output matrix is allocated in Python and written directly by C (zero-copy).
 
 ## Benchmarks
 
 ### Setup
 
-Benchmarked on the StudyForrest dataset (Hanke et al., 2014) via `neuroboros`: 2 subjects, 4 training runs, 4 test runs, radius-20mm searchlights (~9,675 searchlights per hemisphere, ~9,675 cortical vertices per hemisphere). The benchmark runs searchlight Procrustes alignment on both hemispheres and evaluates vertex-wise correlation between aligned and target timeseries.
+Benchmarked on the StudyForrest dataset (Hanke et al., 2014) via `neuroboros`: 2 subjects, 4 training runs, 4 test runs, radius-20mm searchlights (~9,675 searchlights per hemisphere, ~9,675 cortical vertices per hemisphere). The benchmark runs searchlight Procrustes alignment on both hemispheres and reports vertex-wise correlation between aligned and target timeseries.
 
-Hardware: Apple M4 Pro (10 performance + 4 efficiency cores), 48 GB unified memory, macOS.
-
-All times are median of 3 repeats. Data is loaded once before timing begins.
+All times are **median of 3 repeats**. Data is loaded once before timing begins. BLAS internal threading disabled (`MKL_NUM_THREADS=1` / `VECLIB_MAXIMUM_THREADS=1`) to prevent interference with the OpenMP outer loop.
 
 ### How to Run
 
 ```bash
-# 1. Build the C library with OpenMP support
-cd csrc && make OPENMP=1 && cd ..
+# 1. Build the C library with OpenMP (and optionally CUDA)
+cd csrc
+make OPENMP=1                  # macOS or Linux CPU
+make CUDA=1 OPENMP=1           # Linux + NVIDIA GPU
+cd ..
 
-# 2. Install Python dependencies
-pip install neuroboros hyperalignment scipy numpy
-
-# 3. Download the Forrest dataset (first run only, ~2 GB)
-python -c "import neuroboros; neuroboros.Forrest()"
-
-# 4. Run benchmarks (3 repeats, report median)
+# 2. Run benchmarks (3 repeats, report median)
 python benchmark_neuroboros.py /path/to/data --backend python --repeat 3
-VECLIB_MAXIMUM_THREADS=10 python benchmark_neuroboros.py /path/to/data --backend python --repeat 3
-python benchmark_neuroboros.py /path/to/data --backend c64  --n-jobs 1  --repeat 3
-python benchmark_neuroboros.py /path/to/data --backend c64  --n-jobs 10 --repeat 3
-python benchmark_neuroboros.py /path/to/data --backend c32  --n-jobs 1  --repeat 3
-python benchmark_neuroboros.py /path/to/data --backend c32  --n-jobs 10 --repeat 3
-python benchmark_neuroboros.py /path/to/data --backend metal --n-jobs 1  --repeat 3
-python benchmark_neuroboros.py /path/to/data --backend metal --n-jobs 10 --repeat 3
+MKL_NUM_THREADS=1 python benchmark_neuroboros.py /path/to/data --backend c64 --n-jobs 1   --repeat 3
+MKL_NUM_THREADS=1 python benchmark_neuroboros.py /path/to/data --backend c64 --n-jobs 96  --repeat 3
+MKL_NUM_THREADS=1 python benchmark_neuroboros.py /path/to/data --backend c32 --n-jobs 96  --repeat 3
+python benchmark_neuroboros.py /path/to/data --backend cuda --repeat 3
 ```
 
 Options:
-- `--backend`: `python`, `c64`, `c32`, `metal`
-- `--n-jobs N`: Number of OpenMP threads for C backends (default: 1). Requires `OPENMP=1` build.
-- `--repeat N`: Number of alignment repeats (default: 1). Reports median when N > 1.
-- `VECLIB_MAXIMUM_THREADS=N`: Control Apple Accelerate internal thread count for the Python backend (macOS). Use `OPENBLAS_NUM_THREADS=N` or `MKL_NUM_THREADS=N` on Linux.
-
-On Linux, omit the `metal` backend (it will fall back to `c32` automatically).
+- `--backend`: `python`, `c64`, `c32`, `metal` (macOS), `cuda` (Linux/NVIDIA)
+- `--n-jobs N`: OpenMP threads for C backends (default: 1; requires `OPENMP=1` build)
+- `--repeat N`: Number of repeats (default: 1); reports median when N > 1
 
 ### Results
 
-Hardware: Apple M4 Pro (10 performance cores + 4 efficiency cores), 48 GB unified memory, macOS.
+All backends produce identical output (test-set vertex-wise correlation percentiles):
+```
+[-0.2561 -0.0149  0.0030  0.0160  0.0282  0.0424  0.0594  0.0840  0.1252  0.2105  0.6171]
+```
+
+#### Apple M4 Pro — 10 performance cores, 48 GB unified memory, macOS
 
 | Backend | Threads | L hemi (s) | R hemi (s) | Total (s) | vs Python |
 |---------|---------|-----------|-----------|-----------|-----------|
 | Python (numpy/Accelerate) | 1 | 15.1 | 15.0 | 30.1 | 1.0x |
-| Python (numpy/Accelerate) | 10 | 15.4 | 15.4 | 30.8 | 0.98x |
 | C CPU FP64 | 1 | 14.4 | 14.6 | 28.9 | 1.04x |
 | **C CPU FP64** | **10** | **2.2** | **2.2** | **4.3** | **7.0x** |
 | C CPU FP32 | 1 | 9.3 | 9.2 | 18.5 | 1.6x |
 | **C CPU FP32** | **10** | **1.25** | **1.24** | **2.5** | **12.0x** |
 | C Metal GPU FP32 | 10 | 8.3 | 8.4 | 16.8 | 1.8x |
 
-All backends produce identical output (test-set vertex-wise correlation percentiles):
+#### AMD Threadripper 7995WX + NVIDIA RTX 4090 — 96 cores, Ubuntu 24.04
 
-```
-[-0.2561 -0.0149  0.0030  0.0160  0.0282  0.0424  0.0594  0.0840  0.1252  0.2105  0.6171]
-```
+| Backend | Threads | L hemi (s) | R hemi (s) | Total (s) | vs Python |
+|---------|---------|-----------|-----------|-----------|-----------|
+| Python (numpy/MKL) | 1 | 59.8 | 59.5 | 119.5 | 1.0x |
+| C CPU FP64 | 1 | 25.6 | 25.6 | 51.2 | 2.3x |
+| C CPU FP32 | 1 | 17.2 | 17.1 | 34.3 | 3.5x |
+| C CPU FP64 | 32 | 1.6 | 1.7 | 3.3 | 36x |
+| C CPU FP32 | 32 | 1.1 | 1.1 | 2.3 | 52x |
+| **C CPU FP64** | **96** | **1.09** | **1.05** | **2.1** | **57x** |
+| **C CPU FP32** | **96** | **0.64** | **0.59** | **1.2** | **100x** |
+| C CUDA GPU FP32 | — | 21.1 | 21.1 | 42.3 | 2.8x |
 
 ### Analysis
 
-**Correctness**: All backends produce numerically identical percentile distributions at 4 decimal places. The FP32 backends (CPU and Metal) match FP64 because searchlight weight normalization and accumulation are done in FP64 regardless of the local Procrustes precision.
+**Correctness**: All backends produce numerically identical percentile distributions at 4 decimal places. FP32 backends (CPU FP32, Metal, CUDA) match FP64 because searchlight weight normalization and scatter-add accumulation are done in FP64 regardless of local Procrustes precision.
 
-**Performance**: With 10 OpenMP threads, C CPU FP32 (**2.5s**) is **12x faster** than the Python baseline (**30.1s**). C CPU FP64 with 10 threads (**4.3s**) is **7x faster**. Even single-threaded, C FP64 (28.9s) slightly outperforms Python (30.1s), and C FP32 (18.5s) is 1.6x faster. The Python baseline is a single-threaded Python `for` loop calling numpy/scipy (which dispatch to Accelerate for BLAS/LAPACK). Setting `VECLIB_MAXIMUM_THREADS=10` for the Python backend has no measurable effect (~30.8s) because Accelerate's internal multithreading provides negligible benefit for the small (~121x121) per-searchlight SVDs.
+**OpenMP scaling**: The dominant factor is thread count. C CPU FP32 scales well up to core count — on Threadripper reaching **100x** vs Python at 96 threads (1.2s total). Scaling is sub-linear (96 cores → ~28x over 1 thread, not 96x) due to memory bandwidth saturation and NUMA effects across the 4-die Threadripper topology.
 
-**Column-major input**: The Python `hyperalignment` package produces Fortran-contiguous (column-major) data matrices from `np.concatenate`. The searchlight indices are highly scattered across vertices (mean gap ~80, spanning the full vertex array), so row-major column extraction requires ~220K scattered reads per searchlight, thrashing the CPU cache. The C wrapper converts input to Fortran order (`np.asfortranarray`) so the C library can extract searchlight columns via contiguous `memcpy` — this alone accounts for a 2x speedup over the naive row-major approach.
+| Machine | Backend | 1 thread | N threads | Speedup |
+|---------|---------|----------|-----------|---------|
+| M4 Pro | C FP32 | 18.5s | 2.5s (10T) | 7.4x |
+| Threadripper | C FP32 | 34.3s | 1.2s (96T) | 28.6x |
 
-**Dense output**: The C library uses `ha_searchlight_procrustes_dense`, which takes flat concatenated arrays and accumulates into a dense transformation matrix using `#pragma omp atomic` for lock-free scatter-add — matching the approach used by the Python reference implementation. This avoids the overhead of sparse matrix construction (sorting and deduplicating all searchlight index pairs) and binary-search scatter-add that would otherwise dominate at high thread counts.
+**Column-major input is critical**: Searchlight indices are highly scattered across ~9,675 vertices (mean gap ~80). With row-major data, extracting columns for one searchlight requires ~220K scattered reads per searchlight, thrashing the CPU cache. The C wrapper converts input to Fortran order (`np.asfortranarray`) so each column is contiguous — extraction becomes `memcpy` per column. This single change gives a **2x single-threaded speedup**.
 
-**Metal GPU**: The Metal backend uses batched GPU GEMM (256 searchlights per command buffer) with CPU-GPU pipelining — while the GPU computes the next batch of `X^T @ Y` products, the CPU runs Newton iterations for the previous batch. OpenMP parallelizes the CPU Newton stage. Despite these optimizations, Metal is slower than CPU because the ~121x121 local matrices are too small for GPU dispatch overhead to be fully amortized, and Metal Performance Shaders does not provide SVD — requiring an iterative Newton approach with multiple LU factorizations per searchlight.
+**Dense output with OMP atomic**: The library accumulates local transformation matrices into a dense (nv×nv) output using `#pragma omp atomic` for lock-free scatter-add. Compared to the earlier sparse approach (qsort + binary-search per scatter-add + `#pragma omp critical`), this eliminates the global serialization bottleneck that dominated at high thread counts.
 
-**OpenMP scaling** (M4 Pro, 10 performance cores):
+**CUDA GPU is slower than CPU here**: The RTX 4090 CUDA backend (**42.3s**) is much slower than 96-thread CPU FP32 (**1.2s**). The reason is that `cusolverDnSgesvdaStridedBatched` — the only viable batched SVD for 121×121 matrices on GPU — computes an approximate SVD via iterative polar decomposition (Jacobi sweeps). For this problem size, the GPU does not have enough parallelism per matrix to amortize the dispatch overhead, and the 256-matrix batch runs largely serially within the warp structure. Contrast with `cusolverDnSgesvdjBatched` (hard limit: 32×32) or the non-batched routines (effectively serial across 9,675 calls).
 
-| Backend | 1 thread | 10 threads | Speedup |
-|---------|----------|------------|---------|
-| C CPU FP64 | 28.9s | 4.3s | 6.7x |
-| C CPU FP32 | 18.5s | 2.5s | 7.4x |
+**Metal GPU is slower than CPU**: The ~121×121 local matrices are too small for GPU dispatch overhead to be amortized. Metal Performance Shaders does not provide SVD, requiring an iterative Newton approach (multiple LU factorizations per searchlight), which limits throughput.
 
-Scaling is sub-linear (6.7-7.4x on 10 cores) due to memory bandwidth contention and Accelerate-internal threading within individual LAPACK calls.
+**The GPU opportunity for this problem**: A custom one-sided Jacobi SVD CUDA kernel (one thread per matrix element, true batched parallelism at any size) would likely break the GPU bottleneck. Alternatively, a hybrid approach — GPU for `A = X^T @ Y` GEMM, CPU for SVD, GPU for `T = U @ Vt` GEMM — would leverage the GPU for the large matrix multiply while avoiding the SVD dispatch overhead. For the current dataset size, the 96-core CPU already achieves 1.2s total, so GPU acceleration has limited practical benefit.
 
-### Replicating on Other Machines
+### Replicating
 
 **macOS (Apple Silicon)**:
 ```bash
-cd csrc && make OPENMP=1 && make OPENMP=1 test
+cd csrc && make OPENMP=1 test
 cd .. && python benchmark_neuroboros.py /path/to/data --backend c32 --n-jobs 10 --repeat 3
 ```
 
-**macOS (Intel)**:
+**Linux (Anaconda + MKL)**:
 ```bash
-# Metal available but may not have MPS support for all operations
-# CPU backends recommended
-cd csrc && make OPENMP=1 && make OPENMP=1 test
-cd .. && python benchmark_neuroboros.py /path/to/data --backend c64 --n-jobs 4 --repeat 3
+conda install mkl-devel
+cd csrc && make OPENMP=1 test
+MKL_NUM_THREADS=1 python benchmark_neuroboros.py /path/to/data --backend c32 --n-jobs $(nproc) --repeat 3
 ```
 
-**Linux (Ubuntu/Debian)**:
+**Linux + CUDA (Anaconda + MKL + NVIDIA)**:
 ```bash
-# Install LAPACK/BLAS and OpenMP
-sudo apt install liblapack-dev libopenblas-dev libomp-dev
-
-# Build with OpenMP (Metal stubs are automatic; only CPU backends work)
-cd csrc && make OPENMP=1 && make OPENMP=1 test
-
-# Run benchmark (metal backend will fall back to c32 automatically)
-cd .. && python benchmark_neuroboros.py /path/to/data --backend c32 --n-jobs $(nproc) --repeat 3
+conda install mkl-devel
+cd csrc && make CUDA=1 OPENMP=1 test
+MKL_NUM_THREADS=1 python benchmark_neuroboros.py /path/to/data --backend cuda --repeat 3
 ```
 
 ## References

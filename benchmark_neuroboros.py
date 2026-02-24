@@ -51,8 +51,10 @@ def main():
     p = argparse.ArgumentParser(description="Run neuroboros benchmark using a local copy of neuroboros data.")
     p.add_argument("data_dir", help="Path to directory that contains 'forrest' and 'core' (your neuroboros_backup folder).")
     p.add_argument("--outdir", default=None, help="Optional output directory (defaults to <data_dir>/results).")
-    p.add_argument("--backend", choices=["python", "c64", "c32", "metal"], default="python",
-                   help="Backend: python (default), c64 (C CPU FP64), c32 (C CPU FP32), metal (C Metal GPU FP32)")
+    p.add_argument("--backend", choices=["python", "c64", "c32", "metal", "cuda"],
+                   default="python",
+                   help="Backend: python (default), c64 (C CPU FP64), c32 (C CPU FP32), "
+                        "metal (C Metal GPU FP32, macOS only), cuda (C CUDA GPU FP32, NVIDIA)")
     p.add_argument("--n-jobs", type=int, default=1,
                    help="Number of OpenMP threads for C backends (default: 1). Requires OPENMP=1 build.")
     p.add_argument("--repeat", type=int, default=1,
@@ -77,6 +79,15 @@ def main():
             import hyperalignment as ha
         else:
             import hyperalignment_c as hac
+            # Verify CUDA library was built with CUDA support
+            if args.backend == "cuda":
+                import ctypes
+                if not hac._lib.ha_cuda_available():
+                    # ha_cuda_init hasn't been called yet; init to check
+                    rc = hac._lib.ha_cuda_init()
+                    if rc != 0:
+                        print("WARNING: CUDA backend unavailable. "
+                              "Rebuild with 'make CUDA=1 OPENMP=1'.", file=sys.stderr)
     except Exception:
         print("Failed to import required packages. Traceback:", file=sys.stderr)
         traceback.print_exc()
